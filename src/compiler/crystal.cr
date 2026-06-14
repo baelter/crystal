@@ -5,6 +5,11 @@
 
 require "log"
 require "./requires"
+require "./crystal/tune_gc"
+
+# Configure the GC for the compiler's allocation pattern before doing any work.
+# See `Crystal::GCTuning` for details.
+Crystal::GCTuning.setup
 
 Log.setup_from_env(default_level: :warn, default_sources: "crystal.*")
 

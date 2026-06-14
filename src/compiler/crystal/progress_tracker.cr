@@ -15,6 +15,10 @@ module Crystal
     def stage(name, &)
       @current_stage_name = name
 
+      # Keep the compiler's memory bounded when the GC has been disabled for
+      # speed (see `GCTuning`). This runs between phases, off the GC's hot path.
+      GCTuning.enforce_memory_limit
+
       print_stats
       print_progress
 
