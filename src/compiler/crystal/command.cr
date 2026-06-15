@@ -64,6 +64,7 @@ class Crystal::Command
         hierarchy                show type hierarchy
         implementations          show implementations for given call in location
         macro_code_coverage      generate a macro code coverage report
+        semantic-dependencies    analyze cross-file semantic use dependencies
         types                    show type of main variables
         unreachable              show methods that are never called
         --help, -h               show this help
@@ -236,6 +237,9 @@ class Crystal::Command
     when "hierarchy".starts_with?(tool)
       options.shift
       hierarchy
+    when "semantic-dependencies".starts_with?(tool)
+      options.shift
+      semantic_dependencies
     when "dependencies".starts_with?(tool)
       options.shift
       dependencies

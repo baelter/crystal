@@ -187,6 +187,10 @@ module Crystal
         find_root_generic_type_parameters: find_root_generic_type_parameters,
         remove_alias: false)
 
+      if (tracker = @program.semantic_dependencies) && type.is_a?(Type)
+        tracker.record_type_use(node, type)
+      end
+
       case type
       when Const
         if !type.value.type? && !type.visited?

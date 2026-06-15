@@ -99,6 +99,10 @@ class Crystal::Call
 
     @target_defs = matches
 
+    if (tracker = program.semantic_dependencies) && matches
+      matches.each { |target_def| tracker.record(location, target_def.location) }
+    end
+
     bind_to matches if matches
     bind_to block.break if block
 
