@@ -217,6 +217,11 @@ module Crystal
 
     property dependency_printer : DependencyPrinter? = nil
 
+    # When set, semantic analysis records cross-file use dependencies into it.
+    # See `Crystal::SemanticDependencyTracker` and `crystal tool
+    # semantic-dependencies`.
+    property semantic_dependencies : SemanticDependencyTracker? = nil
+
     # Program that was created for the last compilation.
     property! program : Program
 
@@ -305,6 +310,7 @@ module Crystal
       program.progress_tracker = @progress_tracker
       program.warnings = @warnings
       program.optimization_mode = @optimization_mode
+      program.semantic_dependencies = @semantic_dependencies
       program
     end
 

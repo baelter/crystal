@@ -72,6 +72,11 @@ module Crystal
     # files loaded by `require` nodes are only processed once.
     getter requires = Set(String).new
 
+    # When set, semantic analysis records cross-file *use* dependencies into it
+    # (see `Crystal::SemanticDependencyTracker`). `nil` during ordinary
+    # compilation, so there is no overhead unless explicitly requested.
+    property semantic_dependencies : SemanticDependencyTracker? = nil
+
     # All created unions in a program, indexed by an array of opaque
     # ids of each type in the union. The array (the key) is sorted
     # by this opaque id.
