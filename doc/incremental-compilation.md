@@ -136,11 +136,47 @@ the impacted definitions. Correctness hinges on the fingerprint being a
 complete over-approximation of dependencies; conservative invalidation (when in
 doubt, re-analyze) keeps it sound.
 
-**Codegen.** Once semantic results are reused, IR regeneration becomes the next
-bottleneck. The per-type module/`.o` cache already exists; `check_mod_fun`
-already emits per-module declarations for cross-module calls, so IR generation
-can be skipped for unchanged type-modules (reusing their cached `.o`) using the
-same definition-level fingerprints from Stage 4.
+**Codegen — incremental IR generation.** Even with semantic results reused, the
+back end regenerates *all* LLVM IR on every build to feed the per-type `.o`
+cache. The goal of this stage is to skip IR generation for type-modules whose
+typed definitions are unchanged and link their cached `.o` directly.
+
+A prototype was built and is informative about exactly what a correct
+implementation needs (it is **not** merged — see the blocker below):
+
+- *Fingerprinting.* A global *structure epoch* hashed from every instantiated
+  method's mangled name plus every type's layout (instance vars, ancestors)
+  catches all structural/signature/instantiation-set changes. Per-type-module
+  fingerprints hash each instantiation's mangled name and the `to_s` of its
+  typed definition. Skipping is attempted only when the epoch is stable (pure
+  body edits), where IR is a deterministic function of the body source. This
+  part works and validated cleanly.
+- *Linking.* Skipping a module's bodies prunes code generation's reachability,
+  so most modules are never materialized. Their cached `.o` files must therefore
+  be linked from a persisted `module name → object file` map (kept in the
+  incremental state), **not** from the modules the current build happens to
+  produce. Missing this links far too few objects.
+- *Blocker — force-materialization.* Pruning means a changed function reachable
+  only through a skipped (reused) module is never generated. It must be
+  force-materialized after the main walk. But `CodeGenVisitor#codegen_fun`
+  cannot be driven reliably outside the normal top-down walk: primitives and
+  intrinsics (e.g. `allocate`, `Atomic::Ops#load`) have no standalone function
+  and raise (`can't take proc pointer of atomic call`, `Empty enumerable`), and
+  ordinary methods depend on walk-established context. So the entry point used
+  to force-generate changed-but-pruned modules is not currently safe.
+
+The path to a correct implementation is therefore one of:
+
+1. Make IR generation for a single instantiation a well-defined, context-free
+   entry point (so changed modules can be regenerated in isolation), handling
+   primitives/intrinsics explicitly; **or**
+2. Seed the reachability walk with all non-reused (changed) instantiations up
+   front so the normal walk materializes them, while still emitting reused
+   modules' functions as declarations only (the `check_mod_fun` machinery
+   already emits the needed cross-module declarations).
+
+Approach (2) reuses the existing, battle-tested walk and is the recommended
+next step.
 
 ## Trying it
 
