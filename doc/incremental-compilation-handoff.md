@@ -90,6 +90,20 @@ Measured on the compiler's own source and `spec/std_spec.cr`. "Semantic" =
 | std_spec | `Semantic (main)` only | 14.7s | 7.5s (−49%) |
 | compiler src | full warm recompile | ~25s | ~19–20s (−20–26%) |
 
+Real-world app (LavinMQ, which requires Crystal >= 1.20.1, so the official
+1.17.1 can't build it; compared upstream 1.21-dev vs 1.21-dev+GC, the clean
+isolation of the patch). One trivial dep fix needed for 1.21-dev: amq-protocol
+reads the private ivar `IO::Memory#@writeable`, renamed to `@writable`.
+
+| LavinMQ build | upstream | +GC | speedup |
+|---|---|---|---|
+| semantic (`--no-codegen`, t4) | 4.57s | 2.82s | −38% |
+| warm recompile (full O0, t2) | 9.53s | 7.67s | −20% |
+| cold full build (O0, t2) | 33.9s | 29.3s | −14% |
+
+(At t4 the upstream compiler intermittently segfaults in parallel codegen — a
+preview_mt/fork flake; use t2 for stable numbers.)
+
 Phase breakdown of a **warm full recompile** of the compiler (post-GC):
 `top-level 0.75s · ivars 4.4s · main 4.8s · Codegen(crystal) ~6.8s ·
 Codegen(bc+obj) ~3.7s · link ~2.6s`. After GC, the remaining big costs are
