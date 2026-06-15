@@ -222,6 +222,11 @@ module Crystal
     # semantic-dependencies`.
     property semantic_dependencies : SemanticDependencyTracker? = nil
 
+    # Experimental: skip regenerating LLVM IR for type-modules whose typed
+    # definitions are unchanged since the last build, linking their cached `.o`
+    # directly. See `Crystal::IncrementalCodegen`. Off by default.
+    property? incremental = false
+
     # Program that was created for the last compilation.
     property! program : Program
 
@@ -365,20 +370,75 @@ module Crystal
         end
       {% end %}
 
-      llvm_modules = @progress_tracker.stage("Codegen (crystal)") do
-        program.codegen node, debug: debug, frame_pointers: frame_pointers,
-          single_module: @single_module || @cross_compile || !@emit_targets.none?
+      single_module = @single_module || @cross_compile || !@emit_targets.none?
+      output_dir = CacheDir.instance.directory_for(sources)
+      bc_flags_changed = bc_flags_changed? output_dir
+
+      # Incremental codegen: fingerprint the typed program before generating IR,
+      # then run the pre-flight that shrinks the skip set so the link cannot fail
+      # (Layer 1). Codegen runs exactly once — no re-run fallback.
+      prev_state = nil
+      fingerprints = nil
+      skip_modules = Set(String).new
+      if incremental? && !single_module
+        prev_state = IncrementalCodegen::State.load(incremental_state_path(output_dir))
+        fingerprints = IncrementalCodegen.compute(program)
+        unless bc_flags_changed
+          # Pin ids now so the determinism assert sees the same integers a warm
+          # build will bake; id drift forces a full rebuild (never a bad binary).
+          current_type_ids = IncrementalCodegen.pin_type_ids(program)
+          if IncrementalCodegen.type_ids_stable?(prev_state, current_type_ids)
+            candidate = IncrementalCodegen.reusable(prev_state, fingerprints, output_dir)
+            index = IncrementalCodegen.instantiation_index(program)
+            proc_ok = Set(String).new # proc-thunk replay is Phase C; none yet
+            skip_modules = IncrementalCodegen.satisfy(prev_state, candidate, index, proc_ok)
+            if ENV["CRYSTAL_INC_DEBUG"]?
+              stderr.puts "[inc] modules=#{fingerprints.modules.size} reusable=#{candidate.size} skipped=#{skip_modules.size} evicted=#{candidate.size - skip_modules.size}"
+            end
+          elsif ENV["CRYSTAL_INC_DEBUG"]?
+            stderr.puts "[inc] type_id drift -> full rebuild"
+          end
+        end
       end
 
-      output_dir = CacheDir.instance.directory_for(sources)
+      units = codegen_attempt(program, node, output_filename, output_dir, single_module,
+        bc_flags_changed, fingerprints, prev_state, skip_modules)
 
-      bc_flags_changed = bc_flags_changed? output_dir
+      CacheDir.instance.cleanup if @cleanup
+
+      units
+    end
+
+    private def codegen_attempt(program, node, output_filename, output_dir, single_module,
+                                bc_flags_changed, fingerprints, prev_state, skip_modules)
+      llvm_modules = @progress_tracker.stage("Codegen (crystal)") do
+        program.codegen node, debug: debug, frame_pointers: frame_pointers,
+          single_module: single_module, skip_modules: skip_modules,
+          prev_state: prev_state, track_generated_funs: fingerprints != nil
+      end
+
       target_triple = target_machine.triple
 
-      units = llvm_modules.map do |type_name, info|
+      objects = {} of String => String
+      reused_object_names = [] of String
+      units = [] of CompilationUnit
+      llvm_modules.each do |type_name, info|
+        next if skip_modules.includes?(type_name)
         llvm_mod = info.mod
         llvm_mod.target = target_triple
-        CompilationUnit.new(self, program, type_name, llvm_mod, output_dir, bc_flags_changed)
+        unit = CompilationUnit.new(self, program, type_name, llvm_mod, output_dir, bc_flags_changed)
+        units << unit
+        objects[type_name] = unit.object_filename
+      end
+
+      # Carry forward cached objects for skipped modules and link them directly.
+      if prev_state
+        skip_modules.each do |mod|
+          if obj = prev_state.objects[mod]?
+            objects[mod] = obj
+            reused_object_names << obj
+          end
+        end
       end
 
       {% if LibLLVM::IS_LT_170 %}
@@ -391,7 +451,37 @@ module Crystal
         cross_compile program, units, output_filename
       else
         units = with_file_lock(output_dir) do
-          codegen program, units, output_filename, output_dir
+          codegen program, units, output_filename, output_dir, reused_object_names
+        end
+
+        # Persist state only after a successful build, so the next incremental
+        # run never reuses an object file this build failed to produce.
+        if fingerprints
+          live = {} of String => Array(String)
+          program.codegen_live_funs.try &.each { |mod, names| live[mod] = names.to_a }
+
+          # Layer 1: derive each regenerated `.o`'s exports/imports from the
+          # emitted IR (ground truth); carry forward reused modules' tables.
+          exports = {} of String => Array(String)
+          imports = {} of String => Array(String)
+          llvm_modules.each do |type_name, info|
+            next if skip_modules.includes?(type_name)
+            exports[type_name], imports[type_name] = IncrementalCodegen.module_symbols(info.mod)
+          end
+          if prev_state
+            skip_modules.each do |mod|
+              live[mod] = prev_state.live[mod]? || [] of String
+              exports[mod] = prev_state.exports[mod]? || [] of String
+              imports[mod] = prev_state.imports[mod]? || [] of String
+            end
+          end
+
+          IncrementalCodegen::State.new(
+            fingerprints.epoch, fingerprints.modules, objects, live, exports, imports,
+            program.codegen_eager_main || [] of String,
+            program.codegen_main_symbols || [] of IncrementalCodegen::MainSymbolRecord,
+            program.codegen_type_id_table || {} of String => Int32,
+          ).save(incremental_state_path(output_dir))
         end
 
         {% if flag?(:darwin) %}
@@ -403,9 +493,11 @@ module Crystal
         {% end %}
       end
 
-      CacheDir.instance.cleanup if @cleanup
-
       units
+    end
+
+    private def incremental_state_path(output_dir)
+      File.join(output_dir, "incremental#{optimization_mode.suffix}.json")
     end
 
     private def with_file_lock(output_dir, &)
@@ -598,22 +690,24 @@ module Crystal
       end
     end
 
-    private def codegen(program, units : Array(CompilationUnit), output_filename, output_dir)
-      object_names = units.map &.object_filename
+    private def codegen(program, units : Array(CompilationUnit), output_filename, output_dir, reused_object_names = [] of String)
+      object_names = units.map(&.object_filename) + reused_object_names
 
-      @progress_tracker.stage("Codegen (bc+obj)") do
-        @progress_tracker.stage_progress_total = units.size
+      unless units.empty?
+        @progress_tracker.stage("Codegen (bc+obj)") do
+          @progress_tracker.stage_progress_total = units.size
 
-        n_threads = @n_threads.clamp(1..units.size)
+          n_threads = @n_threads.clamp(1..units.size)
 
-        if n_threads == 1
-          sequential_codegen(units)
-        else
-          parallel_codegen(units, n_threads)
-        end
+          if n_threads == 1
+            sequential_codegen(units)
+          else
+            parallel_codegen(units, n_threads)
+          end
 
-        if units.size == 1
-          units.first.emit(@emit_targets, emit_base_filename || output_filename)
+          if units.size == 1
+            units.first.emit(@emit_targets, emit_base_filename || output_filename)
+          end
         end
       end
 
@@ -997,6 +1091,11 @@ module Crystal
         end
 
         @name = "#{@name}#{@compiler.optimization_mode.suffix}"
+        # Incremental builds pin type ids and force the read-fn const path, so
+        # their `.o`/`.bc` differ from a plain build's. Namespace them so a plain
+        # `crystal build` into the same cache can't silently overwrite (poison)
+        # the `.o` a later `--incremental` build reuses.
+        @name = "#{@name}-inc" if @compiler.incremental?
         @object_extension = compiler.codegen_target.object_extension
       end
 

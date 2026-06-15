@@ -2,6 +2,14 @@ struct LLVM::GlobalCollection
   def initialize(@mod : Module)
   end
 
+  def each(&) : Nil
+    g = LibLLVM.get_first_global(@mod)
+    while g
+      yield LLVM::Value.new(g)
+      g = LibLLVM.get_next_global(g)
+    end
+  end
+
   def add(type, name)
     # check_type_context(type, name)
 

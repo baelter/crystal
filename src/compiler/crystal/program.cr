@@ -77,6 +77,20 @@ module Crystal
     # compilation, so there is no overhead unless explicitly requested.
     property semantic_dependencies : SemanticDependencyTracker? = nil
 
+    # Incremental codegen: the live/reachable function set produced by the last
+    # `codegen` call (type-module name => mangled names emitted with a body).
+    # Persisted so the next build can seed pruned-but-live functions.
+    property codegen_live_funs : Hash(String, Set(String))? = nil
+
+    # Incremental codegen: outputs of the last `codegen` call needed to persist
+    # incremental state — the lazily-emitted main-resident helper ledger, the
+    # proc-thunk replay payloads (in-memory, this run), the eager main symbol
+    # snapshot, and the pinned type_id table.
+    property codegen_main_symbols : Array(IncrementalCodegen::MainSymbolRecord)? = nil
+    property codegen_proc_thunks : Hash(String, {Def, Type, Bool})? = nil
+    property codegen_eager_main : Array(String)? = nil
+    property codegen_type_id_table : Hash(String, Int32)? = nil
+
     # All created unions in a program, indexed by an array of opaque
     # ids of each type in the union. The array (the key) is sorted
     # by this opaque id.

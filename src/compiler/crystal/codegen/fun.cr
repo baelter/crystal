@@ -95,6 +95,15 @@ class Crystal::CodeGenVisitor
       args = codegen_fun_signature(mangled_name, target_def, self_type, is_fun_literal, is_closure)
 
       needs_body = !target_def.is_a?(External) || is_exported_fun
+      # Incremental codegen: a reused (unchanged) module's functions are emitted
+      # as declarations only; their definitions come from the cached `.o`.
+      if needs_body && !is_exported_fun && !is_fun_literal && !is_closure && !@skip_modules.empty?
+        mod_name = IncrementalCodegen.module_name(self_type)
+        needs_body = false if !mod_name.empty? && @skip_modules.includes?(mod_name)
+      end
+      if needs_body && track_generated_funs?
+        (@generated_funs[IncrementalCodegen.module_name(self_type)] ||= Set(String).new) << mangled_name
+      end
       if needs_body
         emit_def_debug_metadata target_def unless @debug.none?
         set_current_debug_location target_def if @debug.line_numbers?

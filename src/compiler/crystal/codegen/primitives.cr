@@ -1021,6 +1021,7 @@ class Crystal::CodeGenVisitor
   def codegen_primitive_class_with_type(type : VirtualType, value)
     type_id = type_id(value, type)
     metaclass_fun_name = "~metaclass"
+    record_main_symbol("metaclass", metaclass_fun_name, "")
     func = typed_fun?(@main_mod, metaclass_fun_name) || create_metaclass_fun(metaclass_fun_name)
     func = check_main_fun metaclass_fun_name, func
     call func, [type_id] of LLVM::Value

@@ -66,6 +66,8 @@ class Crystal::CodeGenVisitor
 
   private def type_id_impl(type)
     type_id_name = "#{type.llvm_name}:type_id"
+    record_main_symbol("type_id", type_id_name, type.to_s,
+      aux: {"id" => @program.llvm_id.type_id(type).to_s})
 
     global = @main_mod.globals[type_id_name]?
     unless global

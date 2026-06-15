@@ -229,6 +229,12 @@ module Crystal
       self
     end
 
+    # The already-created virtual type, if any, without forcing creation.
+    # Overridden by `ClassType`/`GenericClassInstanceType` to return `@virtual_type`.
+    def virtual_type?
+      nil
+    end
+
     def instance_type
       self
     end
@@ -1299,6 +1305,11 @@ module Crystal
       @virtual_type ||= VirtualType.new(program, self)
     end
 
+    # The already-created virtual type, if any, without forcing creation.
+    def virtual_type?
+      @virtual_type
+    end
+
     def class?
       true
     end
@@ -2161,6 +2172,11 @@ module Crystal
 
     def virtual_type!
       @virtual_type ||= VirtualType.new(program, self)
+    end
+
+    # The already-created virtual type, if any, without forcing creation.
+    def virtual_type?
+      @virtual_type
     end
 
     delegate depth, defs, superclass, macros, abstract?, struct?,

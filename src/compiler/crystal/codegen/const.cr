@@ -244,6 +244,9 @@ class Crystal::CodeGenVisitor
 
     if !const.needs_init_flag?
       global_name = const.llvm_name
+      # bare value global lives in main; capture its frozen (no-read-fn) shape
+      record_main_symbol("const", global_name, const.llvm_name,
+        IncrementalCodegen::SymbolShape.new(emitted_read_fn: false, no_init_flag: const.no_init_flag?))
       global = declare_const(const)
 
       if @llvm_mod != @main_mod
@@ -255,6 +258,8 @@ class Crystal::CodeGenVisitor
     end
 
     read_function_name = "~#{const.llvm_name}:const_read"
+    record_main_symbol("const", read_function_name, const.llvm_name,
+      IncrementalCodegen::SymbolShape.new(emitted_read_fn: true, no_init_flag: const.no_init_flag?))
     func = typed_fun?(@main_mod, read_function_name) || create_read_const_function(read_function_name, const)
     func = check_main_fun read_function_name, func
     call func

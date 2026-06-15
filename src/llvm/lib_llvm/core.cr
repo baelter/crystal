@@ -156,6 +156,8 @@ lib LibLLVM
   {% else %}
     fun get_named_global_with_length = LLVMGetNamedGlobalWithLength(m : ModuleRef, name : Char*, length : SizeT) : ValueRef
   {% end %}
+  fun get_first_global = LLVMGetFirstGlobal(m : ModuleRef) : ValueRef
+  fun get_next_global = LLVMGetNextGlobal(global_var : ValueRef) : ValueRef
   fun get_initializer = LLVMGetInitializer(global_var : ValueRef) : ValueRef
   fun set_initializer = LLVMSetInitializer(global_var : ValueRef, constant_val : ValueRef)
   fun is_thread_local = LLVMIsThreadLocal(global_var : ValueRef) : Bool
