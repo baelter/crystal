@@ -57,6 +57,11 @@ module Crystal
       @end = false
     end
 
+    def position_before(instruction)
+      @builder.position_before instruction
+      @end = false
+    end
+
     def insert_block
       @builder.insert_block
     end
