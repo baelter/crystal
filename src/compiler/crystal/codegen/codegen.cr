@@ -177,8 +177,11 @@ module Crystal
         # the program's value, so save and restore the post-walk `@last` around
         # them (`process_finished_hooks` already preserves `@last` itself).
         saved_last = visitor.last
+        visitor.inc_phase = "seed"
         visitor.codegen_changed_instantiations(prev_state.live)
+        visitor.inc_phase = "force"
         visitor.force_main_symbols(prev_state) unless ENV["CRYSTAL_INC_NO_FORCE"]?
+        visitor.inc_phase = "walk"
         visitor.last = saved_last
       end
       visitor.process_finished_hooks
@@ -189,6 +192,11 @@ module Crystal
         @codegen_main_symbols = visitor.main_symbols
         @codegen_proc_thunks = visitor.proc_thunks
         @codegen_eager_main = visitor.eager_main_symbols
+        if ENV["CRYSTAL_INC_COLLECT_CHECK"]?
+          live = Set(String).new
+          visitor.generated_funs.each_value { |s| live.concat(s) }
+          incremental_collect_check(node, live)
+        end
       end
       visitor.modules
     end
@@ -275,6 +283,9 @@ module Crystal
     getter proc_thunks = {} of String => {Def, Type, Bool}
     # main symbols present right after the constructor (always re-emitted).
     getter eager_main_symbols = [] of String
+    # debug-only: current incremental codegen phase ("walk" | "seed" | "force").
+    property inc_phase = "walk"
+    property inc_seed_root = "?"
 
     class LLVMVar
       getter pointer : LLVM::Value
@@ -847,6 +858,24 @@ module Crystal
         proc_name = false
         fun_literal_name = "~fun_literal"
       end
+      # Incremental codegen: a proc literal in a generic method body is emitted once
+      # per enclosing instantiation, and multiple such procs share the same base name
+      # (`~proc<type>@file:line`). The plain emission-order counter below numbers them
+      # by codegen walk order, which differs cold-vs-warm (the seed appends pruned
+      # instantiations), breaking byte-identical incremental==cold. Instead key the
+      # number on the enclosing function (its mangled name is unique per instantiation
+      # and deterministic) plus a per-enclosing source-order index. The full enclosing
+      # name keeps every distinct proc's symbol unique (no `.N`, no dedup), and the
+      # numbering no longer depends on emission order.
+      if track_generated_funs?
+        enclosing = context.fun.name
+        key = "#{fun_literal_name} #{enclosing}"
+        idx = @proc_counts[key] + 1
+        @proc_counts[key] = idx
+        suffix = idx > 1 ? idx.to_s : ""
+        return Crystal.safe_mangling(@program, "#{fun_literal_name}~in~#{enclosing}#{suffix}")
+      end
+
       proc_count = @proc_counts[fun_literal_name]
       proc_count += 1
       @proc_counts[fun_literal_name] = proc_count
@@ -2634,11 +2663,17 @@ module Crystal
     end
 
     def codegen_changed_instantiations(prev_live : Hash(String, Array(String)))
+      return if ENV["CRYSTAL_INC_NO_SEED"]?
       index = IncrementalCodegen.instantiation_index(@program)
       prev_live.each do |mod, names|
         next if @skip_modules.includes?(mod) # reused module: cached `.o` has the bodies
         names.each do |name|
           if entry = index[name]?
+            if ENV["CRYSTAL_INC_WATCH"]?
+              actual = entry[0].mangled_name(@program, entry[1])
+              STDERR.puts "[inc-seed] COLLISION root=#{name} resolves-to=#{actual}" if actual != name
+            end
+            @inc_seed_root = name
             target_def_fun(entry[0], entry[1])
           end
         end
@@ -2646,13 +2681,25 @@ module Crystal
     end
 
     def build_string_constant(str, name = "str", *, llvm_mod = @llvm_mod, llvm_typer = @llvm_typer)
+      # In incremental mode, derive the display name from the (content-deduped)
+      # string itself rather than the caller-supplied `name`, which varies per call
+      # site for the same string and would otherwise make the global name depend on
+      # which build-order site created it first.
+      name = str if track_generated_funs?
       name = "#{name[0..18]}..." if name.bytesize > 18
       name = name.gsub '@', '.'
       name = "'#{name}'"
       key = StringKey.new(llvm_mod, str)
       @strings.put_if_absent(key) do
         llvm_context = llvm_mod.context
-        global = llvm_mod.globals.add(llvm_typer.llvm_string_type(str.bytesize), name.gsub('\\', "\\\\"))
+        # In incremental mode, disambiguate the (truncated, 18-char) display name
+        # with a content hash. Otherwise distinct strings sharing a prefix collide on
+        # the same name and LLVM appends an order-dependent `.N` suffix, which breaks
+        # byte-identical incremental==cold output (the suffix tracks emission order).
+        # 16 hex digits (64 bits) keeps the chance of two distinct strings hashing
+        # to the same suffix negligible across a whole program's string set.
+        global_name = track_generated_funs? ? "#{name}.#{::Crystal::Digest::MD5.hexdigest(str)[0, 16]}" : name
+        global = llvm_mod.globals.add(llvm_typer.llvm_string_type(str.bytesize), global_name.gsub('\\', "\\\\"))
         global.linkage = LLVM::Linkage::Private
         global.global_constant = true
         global.initializer = llvm_context.const_struct [

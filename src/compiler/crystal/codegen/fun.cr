@@ -45,6 +45,14 @@ class Crystal::CodeGenVisitor
   end
 
   def declare_fun(mangled_name, func : LLVMTypedFunction) : LLVMTypedFunction
+    if (w = ENV["CRYSTAL_INC_WATCH"]?) && mangled_name.includes?(w)
+      caller = begin
+        context.fun.name
+      rescue
+        "?"
+      end
+      STDERR.puts "[inc-watch] DECLARE #{mangled_name} into mod=#{@llvm_mod.name} caller=#{caller} phase=#{inc_phase}"
+    end
     type = @llvm_typer.copy_type(func.type)
     typed_fun = add_typed_fun(@llvm_mod, mangled_name, type)
 
@@ -103,6 +111,9 @@ class Crystal::CodeGenVisitor
       end
       if needs_body && track_generated_funs?
         (@generated_funs[IncrementalCodegen.module_name(self_type)] ||= Set(String).new) << mangled_name
+      end
+      if (w = ENV["CRYSTAL_INC_WATCH"]?) && mangled_name.includes?(w)
+        STDERR.puts "[inc-watch] CODEGEN_FUN #{mangled_name} needs_body=#{needs_body} mod=#{IncrementalCodegen.module_name(self_type)} phase=#{inc_phase} def_loc=#{target_def.location} seed_root=#{inc_seed_root}"
       end
       if needs_body
         emit_def_debug_metadata target_def unless @debug.none?

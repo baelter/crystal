@@ -77,10 +77,8 @@ module Crystal::IncrementalCodegen
     def replayable?(proc_replayable : Set(String)) : Bool
       case kind
       when "proc_thunk" then proc_replayable.includes?(name)
-      when "match"      then false # union/virtual/nilable types aren't all
-      # re-resolvable by name yet; let the pre-flight evict importers, which
-      # regenerate and re-emit the `~match` themselves.
-      else true
+      when "match"      then aux.try(&.has_key?("ranges")) || false
+      else                   true
       end
     end
   end
@@ -187,6 +185,18 @@ module Crystal::IncrementalCodegen
       mangled.each { |m| ctx.update(m); ctx.update("\n") }
       ctx.update("--structures--\n")
       structures.each { |s| ctx.update(s); ctx.update("\n") }
+      # A symbol literal codegens to `int(@symbols[value])` — a bare integer
+      # baked into the reading module's `.o`, where the index is the symbol's
+      # position in `program.symbols` (codegen.cr `visit(SymbolLiteral)`; the
+      # table itself is `External` in non-main modules). Inserting a symbol
+      # shifts every later symbol's index, but a reader's per-module fingerprint
+      # only renders symbols by NAME, so a skipped reader would keep a stale
+      # baked index (silent miscompile). Symbol order is NOT sortable here (the
+      # order IS the contract), so fold the ordered set into the epoch: any
+      # symbol-set/order change forces a full rebuild, exactly as a type-layout
+      # change does. (type_ids get the same protection via `pin_type_ids`.)
+      ctx.update("--symbols--\n")
+      program.symbols.each { |s| ctx.update(s); ctx.update("\n") }
     end
 
     modules = {} of String => String
@@ -252,7 +262,13 @@ module Crystal::IncrementalCodegen
       syms.each { |s| replayed << s unless all_exports.includes?(s) }
     end
 
+    debug = ENV["CRYSTAL_INC_DEBUG"]?
+    round = 0
+    round1_kinds = Hash(String, Int32).new(0) # direct (round-1) eviction drivers
+    cascade_count = 0
+
     loop do
+      round += 1
       satisfiers = replayed.dup
       prev.exports.each do |mod, syms|
         if skip.includes?(mod)
@@ -271,25 +287,63 @@ module Crystal::IncrementalCodegen
         (prev.imports[mod]? || Array(String).new).any? { |s| !satisfiers.includes?(s) }
       end
       break if evict.empty?
+
+      if debug
+        evict.each do |mod|
+          (prev.imports[mod]? || Array(String).new).each do |s|
+            next if satisfiers.includes?(s)
+            if round == 1
+              round1_kinds[classify_symbol(s)] += 1
+            end
+          end
+          cascade_count += 1 if round > 1
+        end
+      end
+
       evict.each { |mod| skip.delete(mod) }
     end
 
-    if ENV["CRYSTAL_INC_DEBUG"]?
-      satisfiers = replayed.dup
-      prev.exports.each do |mod, syms|
-        syms.each { |s| satisfiers << s if skip.includes?(mod) || mod.empty? || index.has_key?(s) }
-      end
-      unmet = Hash(String, Int32).new(0)
-      (candidate - skip).each do |mod|
-        (prev.imports[mod]? || Array(String).new).each do |s|
-          unmet[classify_symbol(s)] += 1 unless satisfiers.includes?(s)
-        end
-      end
-      STDERR.puts "[inc] candidate=#{candidate.size} skipped=#{skip.size} evicted=#{candidate.size - skip.size}"
-      STDERR.puts "[inc] unmet-import kinds (evicting): #{unmet.to_a.sort_by { |_, n| -n }.first(12)}"
+    if debug
+      STDERR.puts "[inc] candidate=#{candidate.size} skipped=#{skip.size} evicted=#{candidate.size - skip.size} rounds=#{round}"
+      STDERR.puts "[inc] round-1 (direct) eviction drivers: #{round1_kinds.to_a.sort_by { |_, n| -n }.first(12)}"
+      STDERR.puts "[inc] cascade evictions (round>1): #{cascade_count}"
+      whatif_skip(prev, candidate, index, replayed, "match")
+      whatif_skip(prev, candidate, index, replayed, "proc_thunk")
+      whatif_skip(prev, candidate, index, replayed, "match", "proc_thunk")
     end
 
     skip
+  end
+
+  # Counterfactual: how many more modules would skip if the given main-symbol
+  # kinds were replayable (their defines added to the satisfier base). Reruns the
+  # fixpoint with the real index; debug-only.
+  private def self.whatif_skip(prev : State, candidate : Set(String),
+                               index : Hash(String, {Def, Type}),
+                               replayed_base : Set(String), *kinds : String) : Nil
+    replayed = replayed_base.dup
+    prev.main_symbols.each do |rec|
+      next unless kinds.includes?(rec.kind)
+      rec.defines.each { |s| replayed << s }
+      replayed << rec.name
+    end
+    skip = candidate.dup
+    loop do
+      satisfiers = replayed.dup
+      prev.exports.each do |mod, syms|
+        if skip.includes?(mod)
+          syms.each { |s| satisfiers << s }
+        else
+          syms.each { |s| satisfiers << s if index.has_key?(s) }
+        end
+      end
+      evict = skip.select do |mod|
+        (prev.imports[mod]? || Array(String).new).any? { |s| !satisfiers.includes?(s) }
+      end
+      break if evict.empty?
+      evict.each { |mod| skip.delete(mod) }
+    end
+    STDERR.puts "[inc] what-if replay #{kinds.to_a}: skipped=#{skip.size} evicted=#{candidate.size - skip.size}"
   end
 
   # Coarse classification of an LLVM symbol name into a replay "kind", for the
@@ -365,10 +419,127 @@ module Crystal::IncrementalCodegen
     walk_types(program) do |type|
       next unless type.is_a?(DefInstanceContainer)
       type.def_instances.each_value do |typed_def|
-        index[typed_def.mangled_name(program, type)] = {typed_def, type}
+        name = typed_def.mangled_name(program, type)
+        index[name] = {typed_def, type}
       end
     end
+    collision_audit(program) if ENV["CRYSTAL_INC_COLLIDE"]?
     index
+  end
+
+  # One colliding instantiation: the def-instance key (carries `block_type` and
+  # `named_args`, the inputs the positional mangled name omits) plus the typed
+  # def and the self type it codegens under.
+  private record Collider, key : DefInstanceKey, typed_def : Def, self_type : Type
+
+  # Deep collision characterization (CRYSTAL_INC_COLLIDE). Groups every distinct
+  # typed def by its mangled name, then for each name carrying more than one
+  # real (non-primitive, non-abstract) body classifies WHY they collide:
+  #
+  #   * different source def_object_id  -> genuinely different overloads sharing
+  #     a symbol (the structural DefId should have split these; any survivor is
+  #     a DefId completeness bug);
+  #   * same source, differing arg_types.to_s -> distinct concrete types that
+  #     render to the same llvm_name (different body types -> different IR ->
+  #     REAL hazard);
+  #   * same source, same arg types, differing block_type / named_args only ->
+  #     codegen reuses the first body for all; benign iff the bodies' `to_s`
+  #     match (what the per-module fingerprint already keys on).
+  #
+  # The load-bearing metric is BODY-DIVERGENT: collisions whose two typed bodies
+  # render to different `to_s`. Those are the only never-stale hazard; the rest
+  # are merge-equivalent and need no extra identity.
+  def self.collision_audit(program : Program) : Nil
+    groups = Hash(String, Array(Collider)).new { |h, k| h[k] = [] of Collider }
+    walk_types(program) do |type|
+      next unless type.is_a?(DefInstanceContainer)
+      type.def_instances.each do |key, typed_def|
+        name = typed_def.mangled_name(program, type)
+        groups[name] << Collider.new(key, typed_def, type)
+      end
+    end
+
+    total = 0
+    non_primitive = 0
+    diff_source = 0    # different source def (DefId completeness gap)
+    diff_argtypes = 0  # same source, arg_types.to_s differ (llvm_name aliasing)
+    body_divergent = 0 # bodies' to_s differ (the real never-stale hazard)
+    benign = 0         # same source, bodies' to_s identical
+    divergent_samples = [] of String
+    benign_samples = [] of String
+
+    groups.each do |name, colliders|
+      # Distinct typed defs only (def_instances can hold the same object twice
+      # under different keys when use_cache short-circuits).
+      distinct = colliders.uniq { |c| c.typed_def.object_id }
+      next if distinct.size < 2
+      total += distinct.size - 1
+
+      real = distinct.reject do |c|
+        c.typed_def.body.is_a?(Crystal::Primitive) || c.typed_def.abstract?
+      end
+      next if real.size < 2
+      non_primitive += real.size - 1
+
+      a = real[0]
+      real[1..].each do |b|
+        same_source = a.key.def_object_id == b.key.def_object_id
+        same_args = a.key.arg_types.map(&.to_s) == b.key.arg_types.map(&.to_s)
+        # Compare bodies with auto-generated temp-var counters canonicalized:
+        # `__temp_5516` vs `__temp_5756` is the same body instantiated at two
+        # different points, not a real divergence. Codegen emits one body per
+        # symbol, so only a post-normalization difference is a true hazard.
+        same_body = normalize_body(a.typed_def.to_s) == normalize_body(b.typed_def.to_s)
+
+        diff_source += 1 unless same_source
+        diff_argtypes += 1 if same_source && !same_args
+
+        if same_body
+          benign += 1
+          if benign_samples.size < 6
+            benign_samples << "#{name}\n    same_source=#{same_source} same_args=#{same_args}" \
+                              "\n    A block=#{a.key.block_type} named=#{named_args_shape(a.key)}" \
+                              "\n    B block=#{b.key.block_type} named=#{named_args_shape(b.key)}"
+          end
+        else
+          body_divergent += 1
+          if divergent_samples.size < 8
+            divergent_samples << "#{name}\n    same_source=#{same_source} same_args=#{same_args}" \
+                                 "\n    A loc=#{a.typed_def.location} block=#{a.key.block_type} named=#{named_args_shape(a.key)}" \
+                                 "\n    B loc=#{b.typed_def.location} block=#{b.key.block_type} named=#{named_args_shape(b.key)}" \
+                                 "\n    --- A.to_s ---\n#{indent(a.typed_def.to_s)}" \
+                                 "\n    --- B.to_s ---\n#{indent(b.typed_def.to_s)}"
+          end
+        end
+      end
+    end
+
+    STDERR.puts "[inc-collide] total=#{total} NON-PRIMITIVE=#{non_primitive} " \
+                "body-divergent(HAZARD)=#{body_divergent} benign(merge-equiv)=#{benign} " \
+                "diff-source=#{diff_source} diff-argtypes=#{diff_argtypes}"
+    unless divergent_samples.empty?
+      STDERR.puts "[inc-collide] === BODY-DIVERGENT samples (real hazard) ==="
+      divergent_samples.each { |s| STDERR.puts "[inc-collide] #{s}" }
+    end
+    STDERR.puts "[inc-collide] === BENIGN samples (merge-equivalent) ==="
+    benign_samples.each { |s| STDERR.puts "[inc-collide] #{s}" }
+  end
+
+  # Canonicalize compiler-generated temp-var names (`__temp_<n>`) so two
+  # instantiations of the same body that merely differ in the global temp
+  # counter compare equal.
+  private def self.normalize_body(s : String) : String
+    s.gsub(/__temp_\d+/, "__temp_N")
+  end
+
+  private def self.named_args_shape(key : DefInstanceKey) : String
+    na = key.named_args
+    return "nil" unless na
+    na.map { |n| "#{n.name}:#{n.type}" }.join(",")
+  end
+
+  private def self.indent(s : String) : String
+    s.lines.map { |l| "      #{l}" }.join('\n')
   end
 
   # Structural identity of a type: its name, instance vars + their types, and
@@ -396,6 +567,10 @@ module Crystal::IncrementalCodegen
     visited = Set(UInt64).new
     each_type(program, visited, &block)
     program.file_modules.each_value { |fm| each_type(fm, visited, &block) }
+    # Union types live only in `program.unions`, not under any namespace's `types?`,
+    # so without this they're absent from `pin_type_ids` and get lazily-assigned
+    # type_ids during codegen (in walk-vs-seed order) — which diverges cold-vs-warm.
+    program.unions.each_value { |u| each_type(u, visited, &block) }
   end
 
   # Walk every type once: nested types, generic instantiations, metaclasses, and

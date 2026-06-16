@@ -352,7 +352,11 @@ module Crystal
 
     private def bc_flags_changed?(output_dir)
       bc_flags_changed = true
-      current_bc_flags = "#{@codegen_target}|#{@mcpu}|#{@mattr}|#{@link_flags}|#{@mcmodel}"
+      # `debug` and `frame_pointers` change the emitted `.o` but not a module's
+      # incremental fingerprint, so without them here a skipped (reused) module
+      # could carry a `.o` built under different settings. Folding them in forces
+      # a full rebuild when they change, which is correct (never stale).
+      current_bc_flags = "#{@codegen_target}|#{@mcpu}|#{@mattr}|#{@link_flags}|#{@mcmodel}|#{debug}|#{frame_pointers}"
       bc_flags_filename = "#{output_dir}/bc_flags#{optimization_mode.suffix}"
       if File.file?(bc_flags_filename)
         previous_bc_flags = File.read(bc_flags_filename).strip
@@ -381,6 +385,10 @@ module Crystal
       fingerprints = nil
       skip_modules = Set(String).new
       if incremental? && !single_module
+        # Make `Def#mangled_name` fold in the structural DefId for every name it
+        # builds this build (fingerprint, instantiation index, seed, codegen),
+        # consistently. Must be set before the first `mangled_name` call below.
+        program.codegen_incremental = true
         prev_state = IncrementalCodegen::State.load(incremental_state_path(output_dir))
         fingerprints = IncrementalCodegen.compute(program)
         unless bc_flags_changed
@@ -692,6 +700,13 @@ module Crystal
 
     private def codegen(program, units : Array(CompilationUnit), output_filename, output_dir, reused_object_names = [] of String)
       object_names = units.map(&.object_filename) + reused_object_names
+      # Incremental builds split objects into regenerated `units` and reused
+      # `reused_object_names`, so their concatenation order differs from a cold
+      # build's (and across warm builds). Object order is semantically irrelevant
+      # (symbols are unique; startup order is driven by `__crystal_main`, not link
+      # order) but determines the final binary's layout, so sort for a deterministic,
+      # byte-identical incremental==cold executable.
+      object_names.sort! if incremental?
 
       unless units.empty?
         @progress_tracker.stage("Codegen (bc+obj)") do
@@ -1100,7 +1115,14 @@ module Crystal
       end
 
       def generate_bitcode
-        @memory_buffer ||= llvm_mod.write_bitcode_to_memory_buffer
+        @memory_buffer ||= begin
+          # Incremental codegen emits a module's functions in walk order plus
+          # seed/force-appended ones, so the function layout (and thus `.text`/
+          # `.eh_frame`) drifts vs a cold build. Sorting by name makes the object
+          # file deterministic, a prerequisite for byte-identical incremental==cold.
+          llvm_mod.sort_functions! if @compiler.incremental?
+          llvm_mod.write_bitcode_to_memory_buffer
+        end
       end
 
       # To compile a file we first generate a `.bc` file and then create an

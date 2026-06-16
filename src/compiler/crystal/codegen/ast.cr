@@ -59,9 +59,44 @@ module Crystal
           str << ':'
           return_type.llvm_name(str)
         end
+
+        # Incremental codegen (Move 1): the symbol so far is a function of the
+        # concrete self/arg/return TYPES only, so two distinct overloads whose
+        # parameters render to the same concrete `llvm_name` collapse onto one
+        # symbol with two different bodies (e.g. the two `Type#common_descendent`
+        # overloads). Fold in a build-stable, structural identity of the resolved
+        # `Def` so name -> body is a pure function and codegen can never land a
+        # different overload body under a shared symbol. Only under `--incremental`
+        # so normal builds keep their original (shorter) symbol names and output.
+        str << "$D" << def_id_digest if program.codegen_incremental?
       end
 
       Crystal.safe_mangling(program, name)
+    end
+
+    @def_id_digest : String?
+
+    # Build-stable disambiguator among same-mangled overloads. Derived purely
+    # from the def's syntactic signature (name + parameter restrictions + splat/
+    # block shape + free vars + return restriction) — NOT object_id (per-process)
+    # and NOT source location (renders non-deterministically for macro
+    # expansions / VirtualFiles). Overloads must differ in signature, so this
+    # distinguishes them; `previous_def` chains are already disambiguated by the
+    # `'` next-chain in the mangled name above.
+    private def def_id_digest : String
+      @def_id_digest ||= begin
+        src = String.build do |io|
+          io << @name << '|'
+          @args.each { |a| io << a.restriction.try(&.to_s) << ',' }
+          io << "|s" << @splat_index
+          io << "|ds" << @double_splat.try(&.restriction).try(&.to_s)
+          io << "|b" << @block_arg.try(&.restriction).try(&.to_s)
+          io << "|ba" << @block_arity
+          io << "|r" << @return_type.try(&.to_s)
+          io << "|fv" << @free_vars.try(&.join(","))
+        end
+        ::Crystal::Digest::MD5.hexdigest { |ctx| ctx.update(src) }[0, 12]
+      end
     end
 
     def varargs?

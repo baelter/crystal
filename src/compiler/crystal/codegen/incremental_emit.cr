@@ -38,8 +38,29 @@ class Crystal::CodeGenVisitor
         ensure_main_metaclass_fun
       when "check_proc"
         ensure_main_check_proc_fun
-        # "match" is not replayed (see MainSymbolRecord#replayable?): its
-        # importers are evicted and re-emit it during regeneration.
+      when "match"
+        if ranges = rec.aux.try &.["ranges"]?
+          ensure_main_match_fun(rec.name, ranges)
+        end
+      end
+    end
+  end
+
+  # Re-emit a `~match<T>` predicate from its captured id-ranges (point => eq,
+  # range => signed lo<=id<=hi), OR-combined. Behaviorally identical to the
+  # cold build's function because type_ids are pinned; uses constants instead of
+  # loading `:type_id` globals, so it carries no extra imports.
+  private def ensure_main_match_fun(name : String, ranges : String)
+    return if typed_fun?(@main_mod, name)
+    parsed = ranges.split(',').reject(&.empty?).map do |pair|
+      lo, _, hi = pair.partition(':')
+      {lo.to_i, hi.to_i}
+    end
+    in_main do
+      define_main_function(name, [llvm_context.int32], llvm_context.int1) do |func|
+        set_internal_fun_debug_location(func, name)
+        type_id = func.params.first
+        emit_match_id_ranges_body(parsed, type_id)
       end
     end
   end

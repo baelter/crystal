@@ -10,6 +10,9 @@ lib LibLLVMExt
   alias UInt = LibC::UInt
   alias SizeT = LibC::SizeT
 
+  fun sort_module_functions = LLVMExtSortModuleFunctions(m : LibLLVM::ModuleRef)
+  fun sort_module_globals = LLVMExtSortModuleGlobals(m : LibLLVM::ModuleRef)
+
   {% if LibLLVM::IS_LT_90 %}
     fun di_builder_create_enumerator = LLVMExtDIBuilderCreateEnumerator(builder : LibLLVM::DIBuilderRef, name : Char*, name_len : SizeT, value : Int64, is_unsigned : LibLLVM::Bool) : LibLLVM::MetadataRef
     fun clear_current_debug_location = LLVMExtClearCurrentDebugLocation(b : LibLLVM::BuilderRef)

@@ -200,7 +200,14 @@ class Crystal::CodeGenVisitor
             global.initializer = @last
             global.global_constant = true
 
-            if const_type.is_a?(PrimitiveType) || const_type.is_a?(EnumType)
+            # `const.initializer` lets later reads load the global bare instead of
+            # via the `:const_read` function. But it's only set once the const's init
+            # has been codegen'd, so whether a given read sees it depends on walk
+            # order — which differs cold-vs-warm (the seed reorders). Leaving it unset
+            # under incremental makes every read use the (order-independent) read
+            # function, keeping the access IR byte-identical across builds. The global
+            # is still a baked constant; the read function just guards a no-op init.
+            if (const_type.is_a?(PrimitiveType) || const_type.is_a?(EnumType)) && !track_generated_funs?
               const.initializer = @last
             end
           else

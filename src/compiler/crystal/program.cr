@@ -68,6 +68,11 @@ module Crystal
     # If `true`, error messages can be colorized
     property? color = true
 
+    # If `true`, codegen is running an incremental (`--incremental`) build, so
+    # `Def#mangled_name` folds in the structural DefId disambiguator. Off for
+    # normal builds, keeping their symbol names (and output) unchanged.
+    property? codegen_incremental = false
+
     # All required files. The set stores absolute files. This way
     # files loaded by `require` nodes are only processed once.
     getter requires = Set(String).new
