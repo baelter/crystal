@@ -765,14 +765,32 @@ module Crystal
       wg = WaitGroup.new
       mutex = Sync::Mutex.new
 
-      n_threads.times do
-        wg.spawn do
-          while unit = channel.receive?
-            unit.compile(isolate_context: true)
-            mutex.synchronize { @progress_tracker.stage_progress += 1 }
+      {% if flag?(:execution_context) %}
+        # Run the workers in a dedicated execution context rather than spawning
+        # them into the default one alongside the producing main fiber. With the
+        # experimental `execution_context` scheduler a same-context enqueue only
+        # does a local push and never calls `wake_scheduler`, so a fiber woken
+        # while every scheduler has parked can be stranded (the default context's
+        # monitor stops waking schedulers once none are active). The heavy channel
+        # churn of many small modules makes that window reachable and the build
+        # deadlocks. Sending across context boundaries instead routes through
+        # `external_enqueue` -> `wake_scheduler`, which interrupts the event loop
+        # and wakes parked schedulers, so the producer/worker handoff always
+        # makes progress.
+        context = Fiber::ExecutionContext::Parallel.new("codegen", n_threads)
+        n_threads.times do
+          wg.add
+          context.spawn do
+            codegen_worker(channel, mutex)
+          ensure
+            wg.done
           end
         end
-      end
+      {% else %}
+        n_threads.times do
+          wg.spawn { codegen_worker(channel, mutex) }
+        end
+      {% end %}
 
       units.each do |unit|
         # We generate the bitcode in the main thread because LLVM contexts
@@ -791,6 +809,13 @@ module Crystal
       channel.close
 
       wg.wait
+    end
+
+    private def codegen_worker(channel : Channel(CompilationUnit), mutex : Sync::Mutex) : Nil
+      while unit = channel.receive?
+        unit.compile(isolate_context: true)
+        mutex.synchronize { @progress_tracker.stage_progress += 1 }
+      end
     end
 
     private def fork_codegen(units, n_threads)
