@@ -463,11 +463,20 @@ class Crystal::CodeGenVisitor
   def try_inline_call(target_def, body, self_type, call_args)
     return false if target_def.is_a?(External)
 
+    # In a re-green build a virtual multidispatch can carry a stale, uncached
+    # clone of an edited method in a branch's target_defs (re-green's call-rebind
+    # never reaches it). Inline the re-greened (canonical) instance's body so the
+    # output matches a cold build instead of emitting the pre-edit literal.
+    if (engine = @program.regreen) && (canon = engine.canonical_for(target_def))
+      body = canon.body
+    end
+
     case body
     when Nop, NilLiteral, BoolLiteral, CharLiteral, StringLiteral, NumberLiteral, SymbolLiteral
       return true unless @needs_value
 
       accept body
+      record_inline_dep target_def, self_type
       inline_call_return_value target_def, body
       true
     when Var
@@ -475,6 +484,7 @@ class Crystal::CodeGenVisitor
         return true unless @needs_value
 
         @last = self_type.passed_as_self? ? call_args.first : type_id(self_type)
+        record_inline_dep target_def, self_type
         inline_call_return_value target_def, body
         true
       else
@@ -484,11 +494,37 @@ class Crystal::CodeGenVisitor
       return true unless @needs_value
 
       read_instance_var(body.type, self_type, body.name, call_args.first)
+      record_inline_dep target_def, self_type
       inline_call_return_value target_def, body
       true
     else
       false
     end
+  end
+
+  # Incremental codegen: the body we just inlined belongs to the resolved def's
+  # owner module but is emitted into the `.o` we're CURRENTLY writing. Record
+  # that cross-module edge so a later build regenerates this `.o` when the callee
+  # module's fingerprint changes — otherwise the cached `.o` keeps the pre-edit
+  # literal (a stale binary). Two keys matter:
+  #   * caller = `@llvm_mod` (the destination `.o`), NOT `context.type`'s module:
+  #     when a file-private helper (e.g. a macro method) is inlined into another
+  #     type's module, `context.type` is the helper while the emitted code —
+  #     including any nested inline's string constant — lands in `@llvm_mod`.
+  #   * callee = the DEF's owner, not the receiver *self_type*: a call over a
+  #     virtual receiver (`Type+`) can resolve to a concrete leaf
+  #     (`EnumType#type_desc`) whose body lives in the leaf's module.
+  # The main module is regenerated every build, so it needs no edge. Same-module
+  # inlines are covered by the module's own fingerprint. See
+  # `Program#codegen_inline_deps`.
+  private def record_inline_dep(target_def, self_type)
+    return unless track_generated_funs?
+    return if @llvm_mod == @main_mod
+    owner = target_def.owner? || self_type
+    caller_mod = @llvm_mod.name
+    callee_mod = IncrementalCodegen.module_name(owner)
+    return if caller_mod == callee_mod
+    (inline_deps[caller_mod] ||= Set(String).new) << callee_mod
   end
 
   def inline_call_return_value(target_def, body)

@@ -10,7 +10,7 @@ module Crystal
   class Def
     property? abi_info = false
 
-    def mangled_name(program, self_type)
+    def mangled_name(program, self_type, include_return = true)
       name = String.build do |str|
         str << '*'
 
@@ -55,7 +55,7 @@ module Crystal
           end
           str << '>'
         end
-        if return_type = @type
+        if include_return && (return_type = @type)
           str << ':'
           return_type.llvm_name(str)
         end
@@ -83,7 +83,9 @@ module Crystal
     # expansions / VirtualFiles). Overloads must differ in signature, so this
     # distinguishes them; `previous_def` chains are already disambiguated by the
     # `'` next-chain in the mangled name above.
-    private def def_id_digest : String
+    # Public so the incremental *semantic* graph can reuse the same build-stable
+    # structural identity for top-level / unowned defs.
+    def def_id_digest : String
       @def_id_digest ||= begin
         src = String.build do |io|
           io << @name << '|'

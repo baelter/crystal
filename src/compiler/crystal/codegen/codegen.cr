@@ -189,6 +189,7 @@ module Crystal
 
       if track_generated_funs
         @codegen_live_funs = visitor.generated_funs
+        @codegen_inline_deps = visitor.inline_deps
         @codegen_main_symbols = visitor.main_symbols
         @codegen_proc_thunks = visitor.proc_thunks
         @codegen_eager_main = visitor.eager_main_symbols
@@ -276,6 +277,9 @@ module Crystal
     # `.o` never references a symbol the pruned walk forgot to re-emit in main.
     property? track_generated_funs = false
     getter generated_funs = Hash(String, Set(String)).new
+    # caller type-module => callee type-modules whose trivial body it inlined
+    # (the cross-module inline dependency; see `Program#codegen_inline_deps`).
+    getter inline_deps = Hash(String, Set(String)).new
     getter main_symbols = [] of IncrementalCodegen::MainSymbolRecord
     @main_symbol_names = Set(String).new
     # proc-thunk replay payloads captured this run (force_main_symbols runs in

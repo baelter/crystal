@@ -628,6 +628,10 @@ module Crystal
       var = lookup_instance_var node
       node.bind_to(var)
 
+      if graph = @program.semantic_graph
+        graph.record_ivar_read(typed_def?, var.owner?, node.name)
+      end
+
       if @is_initialize &&
          @typeof_nest == 0 &&
          !@vars.has_key?(node.name) &&
@@ -662,6 +666,9 @@ module Crystal
 
     def visit_class_var(node)
       var = lookup_class_var(node)
+      if graph = @program.semantic_graph
+        graph.record_cvar_read(typed_def?, var.owner?, node.name)
+      end
       node.bind_to var
       node.var = var
       var
@@ -823,6 +830,9 @@ module Crystal
       value.accept self
 
       var = lookup_instance_var target
+      if graph = @program.semantic_graph
+        graph.record_ivar_write(typed_def?, var.owner?, target.name)
+      end
       if casted_value = check_automatic_cast(value, var.type, node)
         value = casted_value
       end
@@ -900,6 +910,9 @@ module Crystal
       value.accept self
 
       var = lookup_class_var(target)
+      if graph = @program.semantic_graph
+        graph.record_cvar_write(typed_def?, var.owner?, target.name)
+      end
       target.var = var
       var.thread_local = true if thread_local
 

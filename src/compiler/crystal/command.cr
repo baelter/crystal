@@ -77,7 +77,13 @@ class Crystal::Command
   private getter options
   @compiler : Compiler?
 
+  # Snapshot of the invocation args BEFORE option parsing consumes them — used
+  # to reconstruct the child build command for `--watch` (the parser mutates
+  # `options` in place, so it can't be read back later).
+  getter original_args : Array(String)
+
   def initialize(@options : Array(String))
+    @original_args = @options.dup
     @color = Colorize.default_enabled?(STDOUT, STDERR)
     @error_trace = false
     @progress_tracker = ProgressTracker.new
@@ -590,6 +596,11 @@ class Crystal::Command
         end
         opts.on("--incremental", "Experimental: reuse cached IR for unchanged type-modules") do
           compiler.incremental = true
+        end
+        opts.on("--watch", "Experimental: rebuild on source change (implies --incremental)") do
+          compiler.incremental = true
+          compiler.watch = true
+          compiler.watch_argv = original_args
         end
         opts.on("--threads NUM", "Maximum number of threads to use") do |n_threads|
           compiler.n_threads = n_threads.to_i? || raise Error.new("Invalid thread count: #{n_threads}")

@@ -107,9 +107,14 @@ module Crystal::IncrementalCodegen
     # Type#to_s => assigned type_id integer; asserted equal on a warm build so
     # id drift (the one silent-miscompile hazard) forces a full rebuild instead.
     getter type_id_table : Hash(String, Int32)
+    # caller type-module => callee type-modules whose trivial body it inlined.
+    # A reused caller `.o` embeds those bodies, so `reusable` evicts the caller
+    # when a listed callee module's fingerprint changes (defaults empty for
+    # states written before this field existed — JSON leaves it `{}`).
+    getter inline_deps : Hash(String, Array(String)) = {} of String => Array(String)
 
     def initialize(@epoch, @modules, @objects, @live, @exports, @imports,
-                   @eager_main, @main_symbols, @type_id_table)
+                   @eager_main, @main_symbols, @type_id_table, @inline_deps = {} of String => Array(String))
     end
 
     def self.load(path : String) : State?
@@ -167,7 +172,13 @@ module Crystal::IncrementalCodegen
     structures = [] of String # every type's structural layout
     module_entries = Hash(String, Array(String)).new { |h, k| h[k] = [] of String }
 
+    # Skip types a prior resident codegen materialized — a fresh build computes
+    # its epoch before its codegen mints them, so they must not perturb this
+    # cycle's epoch either (they carry no def_instances). See `pin_type_ids`.
+    codegen_types = program.regreen.try(&.codegen_created_types)
+
     walk_types(program) do |type|
+      next if codegen_types && codegen_types.includes?(type.object_id)
       structures << type_structure(type)
 
       next unless type.is_a?(DefInstanceContainer)
@@ -210,6 +221,39 @@ module Crystal::IncrementalCodegen
     Fingerprints.new(epoch, modules)
   end
 
+  # Diagnostic (M3): per-module sorted entry list ("<mangled>\n<typed_def>"),
+  # so a caller can diff the actual instances in a divergent module instead of
+  # just the module hash.
+  def self.module_entries(program : Program) : Hash(String, Array(String))
+    module_entries = Hash(String, Array(String)).new { |h, k| h[k] = [] of String }
+    walk_types(program) do |type|
+      next unless type.is_a?(DefInstanceContainer)
+      mod = module_name(type)
+      type.def_instances.each_value do |typed_def|
+        name = typed_def.mangled_name(program, type)
+        module_entries[mod] << "#{name}\n#{typed_def}"
+      end
+    end
+    module_entries.each_value(&.sort!)
+    module_entries
+  end
+
+  # Diagnostic (M3): the raw epoch components — the sorted mangled-name list,
+  # the sorted type-structure list, and the ordered symbol list — so a caller
+  # can diff each part element-wise instead of just the combined epoch hash.
+  def self.epoch_parts(program : Program) : {Array(String), Array(String), Array(String)}
+    mangled = [] of String
+    structures = [] of String
+    walk_types(program) do |type|
+      structures << type_structure(type)
+      next unless type.is_a?(DefInstanceContainer)
+      type.def_instances.each_value do |typed_def|
+        mangled << typed_def.mangled_name(program, type)
+      end
+    end
+    {mangled.sort!, structures.sort!, program.symbols.to_a}
+  end
+
   # Candidate reuse set: epoch matches, fingerprint matches, recorded `.o`
   # exists. The main module ("") is never reusable. The pre-flight (`satisfy`)
   # then shrinks this so the link cannot fail.
@@ -221,6 +265,14 @@ module Crystal::IncrementalCodegen
     cur.modules.each do |mod, fp|
       next if mod.empty?
       next unless prev.modules[mod]? == fp
+      # Cross-module inline staleness: a callee whose trivial body this `.o`
+      # inlined changed, so the cached copy is stale. The caller's own
+      # fingerprint can't see it (it renders a Call, not the inlined body), so
+      # gate on the callee modules' fingerprints here. (`compute` renders an
+      # absent module to nil, so a vanished callee also evicts.)
+      if (deps = prev.inline_deps[mod]?) && !ENV["CRYSTAL_INC_NO_INLINE_DEP"]?
+        next if deps.any? { |callee| cur.modules[callee]? != prev.modules[callee]? }
+      end
       object = prev.objects[mod]?
       next unless object
       path = File.join(output_dir, object)
@@ -375,17 +427,35 @@ module Crystal::IncrementalCodegen
   # tables are byte-identical. `pin_type_ids` resolves collisions deterministically.
   def self.type_ids_stable?(prev : State?, current_table : Hash(String, Int32)) : Bool
     return true unless prev
-    return true if prev.type_id_table.empty?
-    current_table == prev.type_id_table
+    old = prev.type_id_table
+    return true if old.empty?
+    stable = current_table == old
+    if !stable && ENV["CRYSTAL_M3_UNION_DEBUG"]?
+      only_new = current_table.keys.to_set - old.keys.to_set
+      only_old = old.keys.to_set - current_table.keys.to_set
+      reid = current_table.keys.select { |k| old.has_key?(k) && old[k] != current_table[k] }
+      STDERR.puts "[m3drift] only_new=#{only_new.size} only_old=#{only_old.size} reid=#{reid.size}"
+      reid.first(8).each { |k| STDERR.puts "[m3drift]   ~ #{k}: #{old[k]} -> #{current_table[k]}" }
+      only_old.first(8).each { |k| STDERR.puts "[m3drift]   -old #{k} = #{old[k]}" }
+      only_new.first(8).each { |k| STDERR.puts "[m3drift]   +new #{k} = #{current_table[k]}" }
+    end
+    stable
   end
 
   # Assign an id to every type up front in a deterministic (sorted) order, so
   # the lazy order-dependent fallback never decides an id, and snapshot the
   # table for the determinism assert above.
   def self.pin_type_ids(program : Program) : Hash(String, Int32)
+    # In a resident process, types a PRIOR cycle's codegen materialized (unions,
+    # metaclasses) linger; a fresh build mints them only after its own pin, so
+    # they are absent from its pinned table. Skip them here so this cycle's table
+    # matches the fresh build's exactly (they keep their cached codegen ids, so
+    # this never changes a baked id). See `ReGreenEngine#codegen_created_types`.
+    codegen_types = program.regreen.try(&.codegen_created_types)
     types = [] of Type
     walk_types(program) do |type|
       next if type.is_a?(VirtualType) || type.is_a?(VirtualMetaclassType)
+      next if codegen_types && codegen_types.includes?(type.object_id)
       types << type
     end
     types.sort_by!(&.to_s)
@@ -414,13 +484,28 @@ module Crystal::IncrementalCodegen
 
   # Index every instantiation by its mangled name, mapping to the typed def and
   # the type it is cached on (its codegen `self_type`).
+  #
+  # The seed (`codegen_changed_instantiations`) re-emits a callee's body into a
+  # regenerated caller by looking the callee's mangled name up here, so on a name
+  # collision the chosen entry decides which body is emitted. After an in-process
+  # re-green the orphaned pre-edit instance still lingers in some type's
+  # `def_instances` and shares its (body-independent) mangled name with the
+  # re-greened instance; plain last-writer-wins would let the orphan's stale body
+  # win and the seed would emit it as a dead copy into the caller, breaking byte
+  # identity. Give the re-greened (live) instances priority: once a live body
+  # claims a name, only another live body may overwrite it.
   def self.instantiation_index(program : Program) : Hash(String, {Def, Type})
     index = {} of String => {Def, Type}
+    live = program.regreen.try &.last_regreen_instances.map(&.typed_def.object_id).to_set
+    live_claimed = Set(String).new
     walk_types(program) do |type|
       next unless type.is_a?(DefInstanceContainer)
       type.def_instances.each_value do |typed_def|
         name = typed_def.mangled_name(program, type)
+        is_live = live ? live.includes?(typed_def.object_id) : false
+        next if live_claimed.includes?(name) && !is_live
         index[name] = {typed_def, type}
+        live_claimed << name if is_live
       end
     end
     collision_audit(program) if ENV["CRYSTAL_INC_COLLIDE"]?
@@ -587,8 +672,12 @@ module Crystal::IncrementalCodegen
       type.each_instantiated_type { |inst| each_type(inst, visited, &block) }
     end
 
-    metaclass = type.metaclass
-    each_type(metaclass, visited, &block) if metaclass != type
+    # `existing_metaclass` (not `metaclass`) so this stays a pure read: the lazy
+    # `metaclass` getter would materialize a never-demanded metaclass type, which
+    # then gets a type_id and bloats the emitted type tables. A genuinely-used
+    # metaclass already exists (typing `T.class` created it) and is still walked.
+    metaclass = type.existing_metaclass
+    each_type(metaclass, visited, &block) if metaclass && metaclass != type
 
     # Virtual types live only as `@virtual_type` on their base, never in any
     # parent's `types?`, so without this their `def_instances` (from `super`,

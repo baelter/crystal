@@ -405,6 +405,10 @@ class Crystal::Call
         typed_def, typed_def_args = prepare_typed_def_with_args(match.def, match_owner, lookup_self_type, match.arg_types, block_arg_type, named_args_types)
         def_instance_owner.add_def_instance(def_instance_key, typed_def) if use_cache
 
+        if (engine = program.regreen) && use_cache
+          engine.record(self, def_instance_key, def_instance_owner, typed_def, match.def)
+        end
+
         if typed_def_return_type = typed_def.return_type
           check_return_type(typed_def, typed_def_return_type, match, match_owner)
         end
@@ -440,6 +444,10 @@ class Crystal::Call
             end
           end
         end
+      end
+
+      if graph = program.semantic_graph
+        graph.record(parent_visitor?.try(&.typed_def?), typed_def)
       end
 
       typed_defs << typed_def
