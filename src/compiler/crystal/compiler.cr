@@ -476,6 +476,7 @@ module Crystal
             program.cleanup_types
             program.cleanup_files
             ReGreenEngine.reset_codegen_emission_state(program, cleaned, semantic_dead)
+            engine.fp_dirty_modules = engine.fp_dirty_modules_for(seeds)
             m3_stabilize(program)
             before_types = ReGreenEngine.materialized_type_ids(program)
             codegen program, cleaned, sources, output_filename
@@ -839,6 +840,7 @@ module Crystal
         # those only after its own pin/epoch snapshot, so the next cycle must
         # exclude them to match it — see `ReGreenEngine#codegen_created_types`.
         cl = (Time.instant - cl0).total_milliseconds
+        engine.fp_dirty_modules = engine.fp_dirty_modules_for(seeds)
         before_types = ReGreenEngine.materialized_type_ids(program)
         cg0 = Time.instant
         codegen program, cleaned, sources, "#{out_prefix}.#{i}"

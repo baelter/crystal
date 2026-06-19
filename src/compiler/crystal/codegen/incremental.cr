@@ -167,21 +167,32 @@ module Crystal::IncrementalCodegen
   end
 
   # Walk the typed program and compute the epoch and per-module fingerprints.
+  #
+  # Per-module entries are gathered first (object ids + lazy render inputs) and
+  # only rendered + hashed when the resident's `fp_module_cache` cannot serve the
+  # module — a module whose def-instance object-id set is unchanged and whose
+  # templates weren't spliced this cycle reuses its cached hash, skipping the
+  # `typed_def.to_s` render that dominates `compute`. A non-resident build
+  # (`program.regreen` nil) has no cache, so it renders everything as before.
   def self.compute(program : Program) : Fingerprints
-    mangled = [] of String    # every instantiation's mangled name
-    structures = [] of String # every type's structural layout
-    module_entries = Hash(String, Array(String)).new { |h, k| h[k] = [] of String }
+    mangled = [] of String    # every instantiation's mangled name (epoch)
+    structures = [] of String # every type's structural layout (epoch)
+    # Per module: render inputs collected during the walk, hashed lazily below.
+    mod_insts = Hash(String, Array({String, Def})).new { |h, k| h[k] = [] of {String, Def} }
+    mod_tmpls = Hash(String, Array(Def)).new { |h, k| h[k] = [] of Def }
+    mod_ids = Hash(String, Array(UInt64)).new { |h, k| h[k] = [] of UInt64 }
 
+    regreen = program.regreen
     # Skip types a prior resident codegen materialized — a fresh build computes
     # its epoch before its codegen mints them, so they must not perturb this
     # cycle's epoch either (they carry no def_instances). See `pin_type_ids`.
-    codegen_types = program.regreen.try(&.codegen_created_types)
+    codegen_types = regreen.try(&.codegen_created_types)
 
     walk_types(program) do |type|
       next if codegen_types && codegen_types.includes?(type.object_id)
       structures << type_structure(type)
 
-      # Fold every method TEMPLATE body into its owner module's fingerprint. A
+      # Collect every method TEMPLATE body for its owner module's fingerprint. A
       # yield-bearing method (`use_cache == false`) is never a cached instance,
       # so `codegen_call_with_block` inlines its body into each caller's `.o`
       # with no symbol and no instance fingerprint — editing it would otherwise
@@ -191,7 +202,10 @@ module Crystal::IncrementalCodegen
       # yield path) so `reusable` evicts the inlining callers. Body `to_s` is
       # line-independent, so an edit elsewhere in the file doesn't perturb it.
       if type.is_a?(ModuleType)
-        fold_template_bodies(type, module_name(type), module_entries)
+        tmod = module_name(type)
+        type.defs.try &.each_value do |list|
+          list.each { |dwm| mod_tmpls[tmod] << dwm.def }
+        end
       end
 
       next unless type.is_a?(DefInstanceContainer)
@@ -199,7 +213,8 @@ module Crystal::IncrementalCodegen
       type.def_instances.each_value do |typed_def|
         name = typed_def.mangled_name(program, type)
         mangled << name
-        module_entries[mod] << "#{name}\n#{typed_def}"
+        mod_ids[mod] << typed_def.object_id
+        mod_insts[mod] << {name, typed_def}
       end
     end
 
@@ -223,29 +238,32 @@ module Crystal::IncrementalCodegen
       program.symbols.each { |s| ctx.update(s); ctx.update("\n") }
     end
 
+    cache = regreen.try(&.fp_module_cache)
+    dirty = regreen.try(&.fp_dirty_modules)
+    all_mods = Set(String).new
+    mod_insts.each_key { |m| all_mods << m }
+    mod_tmpls.each_key { |m| all_mods << m }
+
     modules = {} of String => String
-    module_entries.each do |mod, entries|
+    all_mods.each do |mod|
+      ids = mod_ids[mod]? || [] of UInt64
+      ids.sort!
+      if cache && (hit = cache[mod]?) && hit[0] == ids && !(dirty && dirty.includes?(mod))
+        modules[mod] = hit[1]
+        next
+      end
+      entries = [] of String
+      mod_tmpls[mod]?.try &.each { |d| entries << "tmpl #{d.name} #{d.body}" }
+      mod_insts[mod]?.try &.each { |(name, td)| entries << "#{name}\n#{td}" }
       entries.sort!
-      modules[mod] = ::Crystal::Digest::MD5.hexdigest do |ctx|
+      fp = ::Crystal::Digest::MD5.hexdigest do |ctx|
         entries.each { |e| ctx.update(e); ctx.update("\n") }
       end
+      modules[mod] = fp
+      cache[mod] = {ids, fp} if cache
     end
 
     Fingerprints.new(epoch, modules)
-  end
-
-  # Appends each of *type*'s method-template bodies to its module's fingerprint
-  # entries. Folds the untyped body source (line-independent `to_s`) so editing
-  # a yield-bearing method — whose body is inlined into callers' `.o` with no
-  # symbol or cached instance — moves this owner module's fingerprint, letting
-  # the `inline_dep` edge recorded at the yield codegen site evict the callers.
-  def self.fold_template_bodies(type : ModuleType, tmod : String, entries : Hash(String, Array(String))) : Nil
-    type.defs.try &.each_value do |list|
-      list.each do |dwm|
-        d = dwm.def
-        entries[tmod] << "tmpl #{d.name} #{d.body}"
-      end
-    end
   end
 
   # Diagnostic (M3): per-module sorted entry list ("<mangled>\n<typed_def>"),

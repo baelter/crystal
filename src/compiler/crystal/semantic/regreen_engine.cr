@@ -51,6 +51,45 @@ module Crystal
     # only), so it still counts. Accumulated by `note_codegen_types`.
     getter codegen_created_types = Set(UInt64).new
 
+    # Per-module fingerprint cache for the resident incremental `compute`
+    # (`IncrementalCodegen.compute`): module name => {sorted def-instance
+    # typed_def object_ids, fingerprint hash}. A cycle whose module has the same
+    # instance object-id set — and no spliced template (see `fp_dirty_modules`) —
+    # reuses the cached hash instead of re-rendering every instance body. Sound
+    # because every typed_def the engine ever recorded stays referenced by
+    # `@instances` (and live instances by their `def_instances` hash) for the
+    # process lifetime, so a freed slot is never reused: an unchanged object-id
+    # set ⟺ the identical def objects ⟺ an identical fingerprint.
+    getter fp_module_cache = {} of String => {Array(UInt64), String}
+
+    # Modules whose method TEMPLATE bodies were spliced this cycle, set before
+    # codegen via `fp_dirty_modules_for`. A yield-method body edit moves a
+    # template body folded into module M's fingerprint without changing any
+    # instance object_id in M (the instance is cached on an including type's
+    # module), so M's object-id set alone would miss it; `compute` force-
+    # recomputes these. Empty on the initial / no-op cycle.
+    property fp_dirty_modules = Set(String).new
+
+    # The modules whose template bodies the splice of *seed_def_ids* changed: the
+    # owner module of every recorded instance cloned from a seeded template.
+    # `compute` recomputes these even when their instance object-id set is
+    # unchanged, because the spliced template object is reused in place (same
+    # object_id) yet its folded body moved. Mirrors `record_inline_dep`'s callee
+    # key (`module_name(target_def.owner)`).
+    def fp_dirty_modules_for(seed_def_ids : Set(UInt64)) : Set(String)
+      mods = Set(String).new
+      @instances.each do |i|
+        next unless seed_def_ids.includes?(i.untyped_def.object_id)
+        if ow = i.untyped_def.owner?
+          mods << IncrementalCodegen.module_name(ow)
+        end
+        if tow = i.typed_def.owner?
+          mods << IncrementalCodegen.module_name(tow)
+        end
+      end
+      mods
+    end
+
     # The object ids of every currently-materialized type (a pure read — uses the
     # non-creating metaclass walk). The resident diffs this around each codegen to
     # learn which types that codegen materialized.
