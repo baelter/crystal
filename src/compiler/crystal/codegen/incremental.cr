@@ -181,6 +181,19 @@ module Crystal::IncrementalCodegen
       next if codegen_types && codegen_types.includes?(type.object_id)
       structures << type_structure(type)
 
+      # Fold every method TEMPLATE body into its owner module's fingerprint. A
+      # yield-bearing method (`use_cache == false`) is never a cached instance,
+      # so `codegen_call_with_block` inlines its body into each caller's `.o`
+      # with no symbol and no instance fingerprint — editing it would otherwise
+      # leave every inlining caller stale. Folding the template body here makes
+      # the owner module's fingerprint move on such an edit; codegen records a
+      # caller→owner-module `inline_dep` edge (see `record_inline_dep` on the
+      # yield path) so `reusable` evicts the inlining callers. Body `to_s` is
+      # line-independent, so an edit elsewhere in the file doesn't perturb it.
+      if type.is_a?(ModuleType)
+        fold_template_bodies(type, module_name(type), module_entries)
+      end
+
       next unless type.is_a?(DefInstanceContainer)
       mod = module_name(type)
       type.def_instances.each_value do |typed_def|
@@ -219,6 +232,20 @@ module Crystal::IncrementalCodegen
     end
 
     Fingerprints.new(epoch, modules)
+  end
+
+  # Appends each of *type*'s method-template bodies to its module's fingerprint
+  # entries. Folds the untyped body source (line-independent `to_s`) so editing
+  # a yield-bearing method — whose body is inlined into callers' `.o` with no
+  # symbol or cached instance — moves this owner module's fingerprint, letting
+  # the `inline_dep` edge recorded at the yield codegen site evict the callers.
+  def self.fold_template_bodies(type : ModuleType, tmod : String, entries : Hash(String, Array(String))) : Nil
+    type.defs.try &.each_value do |list|
+      list.each do |dwm|
+        d = dwm.def
+        entries[tmod] << "tmpl #{d.name} #{d.body}"
+      end
+    end
   end
 
   # Diagnostic (M3): per-module sorted entry list ("<mangled>\n<typed_def>"),

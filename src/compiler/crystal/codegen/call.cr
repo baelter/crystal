@@ -295,6 +295,12 @@ class Crystal::CodeGenVisitor
 
         target_def = node.target_def
 
+        # The yield method's body is inlined into this caller's `.o` with no
+        # symbol; record a caller→owner-module edge so a warm `--incremental`
+        # rebuild evicts this caller when the inlined body changes (the owner
+        # module's fingerprint carries the template body — see `compute`).
+        record_inline_dep(target_def, self_type)
+
         set_ensure_exception_handler(node)
         set_ensure_exception_handler(target_def)
 
