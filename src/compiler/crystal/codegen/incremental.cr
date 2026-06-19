@@ -283,6 +283,25 @@ module Crystal::IncrementalCodegen
     module_entries
   end
 
+  # Force the lazy generic-metaclass materialization that `compute` performs as a
+  # side effect of rendering a type's ancestors (`type_structure`), returning the
+  # set of materialized type object-ids. `m3_stabilize` loops this to a fixpoint
+  # so every such metaclass exists BEFORE the epoch snapshot — a type materialized
+  # mid-`compute` is excluded from this cycle's epoch yet present next cycle, and
+  # `reusable` then bails on the mismatch (no module skipped). Runs the exact
+  # `type_structure` `compute` runs (identical materialization) but skips the
+  # per-instance mangled-name render and the sort that the full `epoch_parts`
+  # pays — materialization is driven purely by the type walk, and settling is
+  # detected by the type-id set stabilizing (it only grows, by minted metaclasses).
+  def self.materialize_pass(program : Program) : Set(UInt64)
+    ids = Set(UInt64).new
+    walk_types(program) do |type|
+      type_structure(type)
+      ids << type.object_id
+    end
+    ids
+  end
+
   # Diagnostic (M3): the raw epoch components — the sorted mangled-name list,
   # the sorted type-structure list, and the ordered symbol list — so a caller
   # can diff each part element-wise instead of just the combined epoch hash.

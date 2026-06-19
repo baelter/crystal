@@ -861,13 +861,15 @@ module Crystal
       end
     end
 
-    # Call `epoch_parts` until two consecutive results match (the lazy-type
-    # materialization side effect of the walk has settled). Returns the number
-    # of iterations needed (-1 if it never settled). Capped against a loop.
+    # Drive the lazy generic-metaclass materialization to a fixpoint: run
+    # `materialize_pass` (the same `type_structure` walk `compute` performs, minus
+    # the per-instance mangled-name render and sort) until the materialized
+    # type-id set stops growing. Returns iterations (-1 if it never settled).
+    # Capped against a loop.
     private def m3_stabilize(program) : Int32
-      prev = IncrementalCodegen.epoch_parts(program)
+      prev = IncrementalCodegen.materialize_pass(program)
       (1..6).each do |i|
-        cur = IncrementalCodegen.epoch_parts(program)
+        cur = IncrementalCodegen.materialize_pass(program)
         return i if cur == prev
         prev = cur
       end
