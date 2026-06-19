@@ -283,8 +283,12 @@ module Crystal
       m3_noexit = incr ? ENV["CRYSTAL_M3_NOEXIT"]? : nil
       m3_resident = incr ? ENV["CRYSTAL_M3_RESIDENT"]? : nil
       m3_dump_files = incr ? ENV["CRYSTAL_M3_DUMP_FILES"]? : nil
-      m3_mode = m3a_mode || m3b_new || m3_fp || m3_resident || m3_dump_files
-      program.regreen = ReGreenEngine.new if m3a_mode || m3b_new || m3_resident || m3_dump_files
+      # `--watch` drives the in-process re-green resident loop by default (no env):
+      # record instantiations during this cold build, leave the AST uncleaned for
+      # re-green, and hand off to `run_watch_resident` after the first build.
+      watch_resident = incr && watch? && !@no_codegen
+      m3_mode = m3a_mode || m3b_new || m3_fp || m3_resident || m3_dump_files || watch_resident
+      program.regreen = ReGreenEngine.new if m3a_mode || m3b_new || m3_resident || m3_dump_files || watch_resident
       node = parse program, source
 
       # M3 experiments disable main-node cleanup so re-green operates on raw
@@ -345,6 +349,11 @@ module Crystal
         exit 0
       end
 
+      if watch_resident && (engine = program.regreen)
+        run_watch_resident(program, engine, node, source, output_filename)
+        return Result.new program, node
+      end
+
       if (engine = program.regreen) && m3_resident
         run_m3_resident(program, engine, node, source)
       end
@@ -372,34 +381,50 @@ module Crystal
       print_macro_run_stats(program)
       print_codegen_stats(units)
 
-      run_watch(program, source) if watch? && !@no_codegen
-
       Result.new program, node
     end
 
-    # `--watch`: after the first build, poll the required source files and re-run
-    # the build as a CHILD process on any change. Each rebuild is a fresh
-    # `--incremental` build — sound and never-stale by construction (no in-process
-    # re-entrancy), reusing the on-disk `.o` cache for unchanged modules. The
-    # in-process re-green fast path (`CRYSTAL_M3_RESIDENT`) is the experimental
-    # speedup layered on top; the default watch path stays unconditionally sound.
-    private def run_watch(program, sources) : Nil
-      files = Set(String).new
-      program.requires.each { |f| files << f if File.file?(f) }
-      sources.each { |s| files << s.filename if File.file?(s.filename) }
+    # `--watch`: hold the typed program in memory after the first build and, on
+    # each source change, re-green only the edited method bodies and re-run
+    # `--incremental` codegen IN PROCESS — the semantic-amortizing fast rebuild.
+    # Any edit outside the body-only splice envelope (a signature/def-set change,
+    # a const/top-level edit, a new or removed `require`), or a re-green that
+    # can't reproduce the cold result, falls back to a fresh `crystal build
+    # --incremental` subprocess and then re-execs `--watch` so the resident
+    # program matches disk again. Never stale by construction: every rebuild is
+    # byte-identical to a cold build of that source, or IS a cold build.
+    private def run_watch_resident(program, engine, node, sources, output_filename) : Nil
+      program.codegen_incremental = true
+      # First build: clean + codegen the initial binary and capture the dead-
+      # external baseline the per-cycle codegen reset needs (externals dead since
+      # semantic — duplicate fun declarations — must stay dead across cycles).
+      cleaned = program.cleanup(node)
+      program.cleanup_types
+      program.cleanup_files
+      semantic_dead = ReGreenEngine.collect_dead_externals(cleaned)
+      m3_stabilize(program)
+      codegen program, cleaned, sources, output_filename
+
+      # Snapshot each watched file's CONTENT (the pre-edit source the gate diffs
+      # against — the file is edited in place) and mtime.
+      watched = Set(String).new
+      program.requires.each { |f| watched << f if File.file?(f) }
+      sources.each { |s| watched << s.filename if File.file?(s.filename) }
+      src = {} of String => String
       mtime = {} of String => Time
-      files.each { |f| mtime[f] = File.info(f).modification_time }
-      # Re-run ourselves without `--watch` so the child does one build and exits.
-      # Use the captured original args (the global ARGV was consumed by the
-      # option parser, so it no longer holds the build subcommand or flags).
+      watched.each do |f|
+        src[f] = File.read(f)
+        mtime[f] = File.info(f).modification_time
+      end
+
       child = (watch_argv || ARGV).reject { |a| a == "--watch" }
       child << "--incremental" unless child.includes?("--incremental")
       exe = Process.executable_path || PROGRAM_NAME
-      stderr.puts "[watch] watching #{files.size} files (Ctrl-C to stop)"
+      stderr.puts "[watch] watching #{watched.size} files — in-process re-green (Ctrl-C to stop)"
       loop do
         sleep 300.milliseconds
         changed = [] of String
-        files.each do |f|
+        watched.each do |f|
           info = File.info?(f)
           next unless info
           mt = info.modification_time
@@ -409,11 +434,51 @@ module Crystal
         end
         next if changed.empty?
         names = changed.map { |f| File.basename(f) }.join(", ")
-        stderr.puts "[watch] #{Time.local.to_s("%H:%M:%S")} changed: #{names} — rebuilding…"
+        stderr.print "[watch] #{Time.local.to_s("%H:%M:%S")} #{names} — "
         t0 = Time.instant
+
+        # Gate every changed file; the first one outside the body-only envelope
+        # (or a brand-new/removed file with no snapshot) forces a full rebuild.
+        seeds = Set(UInt64).new
+        in_envelope = changed.all? do |f|
+          old = src[f]?
+          if old && (s = m3_seeds_from_src(program, engine, old, File.read(f), f))
+            seeds.concat(s)
+            true
+          else
+            false
+          end
+        end
+
+        if in_envelope
+          n, errors, unsound = engine.reinfer_defs(program, seeds, node)
+          if errors == 0 && unsound == 0
+            cleaned = program.cleanup(node)
+            engine.last_regreen_instances.each { |inst| program.cleanup_transformer.cleanup_def(inst.typed_def) }
+            program.cleanup_types
+            program.cleanup_files
+            ReGreenEngine.reset_codegen_emission_state(program, cleaned, semantic_dead)
+            m3_stabilize(program)
+            before_types = ReGreenEngine.materialized_type_ids(program)
+            codegen program, cleaned, sources, output_filename
+            engine.note_codegen_types(before_types, ReGreenEngine.materialized_type_ids(program))
+            changed.each { |f| src[f] = File.read(f) }
+            stderr.puts "re-green #{n} def(s) (#{(Time.instant - t0).total_seconds.round(2)}s)"
+            next
+          end
+        end
+
+        # Out of envelope: a sound full rebuild, then re-exec `--watch` so the
+        # held program matches disk again.
+        stderr.puts "full rebuild…"
         status = Process.run(exe, child, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
         dt = (Time.instant - t0).total_seconds.round(2)
-        stderr.puts status.success? ? "[watch] ok (#{dt}s)" : "[watch] FAILED (exit #{status.exit_code}, #{dt}s)"
+        if status.success?
+          stderr.puts "[watch] ok (#{dt}s) — reloading"
+          Process.exec(exe, watch_argv || ARGV)
+        else
+          stderr.puts "[watch] FAILED (exit #{status.exit_code}, #{dt}s)"
+        end
       end
     end
 
@@ -1588,6 +1653,10 @@ module Crystal
         Process.run(command, args, shell: true,
           input: Process::Redirect::Close, output: Process::Redirect::Inherit, error: Process::Redirect::Pipe) do |process|
           process.error.each_line(chomp: false) do |line|
+            # Linker output is not guaranteed valid UTF-8 (incremental `.o` names
+            # embed raw digest bytes), and `gsub` with a Regex raises on invalid
+            # bytes; scrub them first so a benign linker note can't abort the build.
+            line = line.scrub
             hint_string = colorize("(this usually means you need to install the development package for lib\\1)").yellow.bold
             line = line.gsub(/cannot find -l(\S+)\b/, "cannot find -l\\1 #{hint_string}")
             line = line.gsub(/unable to find library -l(\S+)\b/, "unable to find library -l\\1 #{hint_string}")

@@ -24,7 +24,8 @@ module Crystal
       key : DefInstanceKey,
       owner : DefInstanceContainer,
       typed_def : Def,
-      untyped_def : Def
+      untyped_def : Def,
+      cached : Bool
 
     getter instances = [] of Instance
 
@@ -93,8 +94,8 @@ module Crystal
     # *untyped_def* is the template (`match.def`) the instance was cloned from;
     # its `object_id` matches `key.def_object_id` and identifies an edit seed.
     def record(call : Call, key : DefInstanceKey, owner : DefInstanceContainer,
-               typed_def : Def, untyped_def : Def) : Nil
-      @instances << Instance.new(call, key, owner, typed_def, untyped_def)
+               typed_def : Def, untyped_def : Def, cached : Bool) : Nil
+      @instances << Instance.new(call, key, owner, typed_def, untyped_def, cached)
     end
 
     # Re-infer every recorded instance whose mangled name contains *filter*
