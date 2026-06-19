@@ -236,6 +236,23 @@ module Crystal
     # them) used to reconstruct the child build command in `run_watch`.
     property watch_argv : Array(String)? = nil
 
+    # Set while a resident re-green loop drives repeated codegens in one process
+    # (`run_watch_resident` / `run_m3_resident`). Lets `codegen` carry the
+    # incremental `State` in memory across cycles instead of round-tripping the
+    # multi-MB JSON to disk every cycle (the resident is its only consumer).
+    property? incremental_resident = false
+
+    # The incremental `State` built by the previous resident cycle, reused as the
+    # next cycle's `prev_state` in memory (skips `State.load`); nil before the
+    # first codegen. The `.o` files it references are still on disk.
+    property resident_state : IncrementalCodegen::State? = nil
+
+    # Per-codegen incremental bookkeeping timings (ms), read by the resident loop
+    # for its per-cycle breakdown.
+    property inc_t_load = 0.0
+    property inc_t_compute = 0.0
+    property inc_t_save = 0.0
+
     # Program that was created for the last compilation.
     property! program : Program
 
@@ -395,6 +412,7 @@ module Crystal
     # byte-identical to a cold build of that source, or IS a cold build.
     private def run_watch_resident(program, engine, node, sources, output_filename) : Nil
       program.codegen_incremental = true
+      self.incremental_resident = true
       # First build: clean + codegen the initial binary and capture the dead-
       # external baseline the per-cycle codegen reset needs (externals dead since
       # semantic — duplicate fun declarations — must stay dead across cycles).
@@ -469,7 +487,11 @@ module Crystal
         end
 
         # Out of envelope: a sound full rebuild, then re-exec `--watch` so the
-        # held program matches disk again.
+        # held program matches disk again. Flush the in-memory State first so the
+        # fallback subprocess reuses this session's warm `.o` cache.
+        if st = @resident_state
+          st.save(incremental_state_path(CacheDir.instance.directory_for(sources)))
+        end
         stderr.puts "full rebuild…"
         status = Process.run(exe, child, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
         dt = (Time.instant - t0).total_seconds.round(2)
@@ -746,6 +768,7 @@ module Crystal
     # CRYSTAL_M3_RES_OUT (output prefix).
     private def run_m3_resident(program, engine, node, sources)
       program.codegen_incremental = true
+      self.incremental_resident = true
       edited_file = ENV["CRYSTAL_M3B_FILE"]? || sources.first.filename
       out_prefix = ENV["CRYSTAL_M3_RES_OUT"]? || "/tmp/m3res"
       # FINAL_ONLY mode: re-green every edit but only cleanup+codegen after the
@@ -762,11 +785,13 @@ module Crystal
       # not expose the prelude funs.
       semantic_dead = nil
       edits.each_with_index do |ef, i|
+        cyc0 = Time.instant
         seeds = m3_compute_seeds(program, engine, ef, edited_file)
         unless seeds
           stderr.puts "[m3res] edit #{i}: FAIL_CLOSED (non-body)"
           next
         end
+        gate = (Time.instant - cyc0).total_milliseconds
         t0 = Time.instant
         n, errors, unsound = engine.reinfer_defs(program, seeds, node)
         sem = (Time.instant - t0).total_milliseconds
@@ -776,6 +801,7 @@ module Crystal
           next
         end
         next if final_only && i < edits.size - 1
+        cl0 = Time.instant
         cleaned = program.cleanup(node)
         # The memoized cleanup transformer skips any def whose callers were
         # cleaned on an earlier cycle, so the walk above never reaches the bodies
@@ -812,12 +838,14 @@ module Crystal
         # `metaclass` getter, unions into `program.unions`). A fresh build mints
         # those only after its own pin/epoch snapshot, so the next cycle must
         # exclude them to match it — see `ReGreenEngine#codegen_created_types`.
+        cl = (Time.instant - cl0).total_milliseconds
         before_types = ReGreenEngine.materialized_type_ids(program)
         cg0 = Time.instant
         codegen program, cleaned, sources, "#{out_prefix}.#{i}"
         cg = (Time.instant - cg0).total_milliseconds
         engine.note_codegen_types(before_types, ReGreenEngine.materialized_type_ids(program))
-        stderr.puts "[m3res] edit #{i}: codegen -> #{out_prefix}.#{i} (#{cg.round(1)}ms, re-green+codegen=#{(sem + cg).round(1)}ms)"
+        full = (Time.instant - cyc0).total_milliseconds
+        stderr.puts "[m3res] edit #{i}: codegen -> #{out_prefix}.#{i} (#{cg.round(1)}ms, re-green+codegen=#{(sem + cg).round(1)}ms, gate=#{gate.round(1)}ms cleanup+stab=#{cl.round(1)}ms full_cycle=#{full.round(1)}ms) [load=#{@inc_t_load.round(1)}ms compute=#{@inc_t_compute.round(1)}ms save=#{@inc_t_save.round(1)}ms]"
       end
       exit 0
     end
@@ -980,8 +1008,15 @@ module Crystal
         # builds this build (fingerprint, instantiation index, seed, codegen),
         # consistently. Must be set before the first `mangled_name` call below.
         program.codegen_incremental = true
-        prev_state = IncrementalCodegen::State.load(incremental_state_path(output_dir))
+        t = Time.instant
+        # Resident: reuse the previous cycle's State from memory (skips the
+        # multi-MB JSON read); fall back to disk on the first cycle / cold build.
+        prev_state = (incremental_resident? ? @resident_state : nil) ||
+                     IncrementalCodegen::State.load(incremental_state_path(output_dir))
+        @inc_t_load = (Time.instant - t).total_milliseconds
+        t = Time.instant
         fingerprints = IncrementalCodegen.compute(program)
+        @inc_t_compute = (Time.instant - t).total_milliseconds
         unless bc_flags_changed
           # Pin ids now so the determinism assert sees the same integers a warm
           # build will bake; id drift forces a full rebuild (never a bad binary).
@@ -1083,13 +1118,23 @@ module Crystal
             end
           end
 
-          IncrementalCodegen::State.new(
+          state = IncrementalCodegen::State.new(
             fingerprints.epoch, fingerprints.modules, objects, live, exports, imports,
             program.codegen_eager_main || [] of String,
             program.codegen_main_symbols || [] of IncrementalCodegen::MainSymbolRecord,
             program.codegen_type_id_table || {} of String => Int32,
             inline_deps,
-          ).save(incremental_state_path(output_dir))
+          )
+          t = Time.instant
+          # Resident: carry the State in memory for the next cycle's `prev_state`
+          # instead of writing it (the `.o` files are still on disk; the JSON is
+          # flushed before a fallback subprocess rebuild). Cold builds save now.
+          if incremental_resident?
+            @resident_state = state
+          else
+            state.save(incremental_state_path(output_dir))
+          end
+          @inc_t_save = (Time.instant - t).total_milliseconds
         end
 
         {% if flag?(:darwin) %}
