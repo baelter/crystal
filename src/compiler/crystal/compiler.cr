@@ -1,6 +1,7 @@
 require "option_parser"
 require "file_utils"
 require "colorize"
+require "socket"
 require "crystal/digest/md5"
 {% if flag?(:msvc) %}
   require "./loader"
@@ -233,8 +234,19 @@ module Crystal
     property? watch = false
 
     # The original invocation args (captured before option parsing consumed
-    # them) used to reconstruct the child build command in `run_watch`.
+    # them) used to reconstruct the child build command in `run_watch` and to
+    # spawn the re-green daemon.
     property watch_argv : Array(String)? = nil
+
+    # Experimental `--daemon`: a one-shot `crystal build --daemon` that forwards
+    # the build to a resident re-green server (spawning one on first use), so a
+    # plain CLI build gets the warm-rebuild speed without an interactive `--watch`.
+    property? daemon = false
+
+    # Internal: when set (`--daemon-serve PATH`), this process IS the daemon —
+    # after the first build it holds the typed program and serves re-green builds
+    # over the unix socket at PATH instead of exiting.
+    property daemon_serve_socket : String? = nil
 
     # Set while a resident re-green loop drives repeated codegens in one process
     # (`run_watch_resident` / `run_m3_resident`). Lets `codegen` carry the
@@ -304,8 +316,9 @@ module Crystal
       # record instantiations during this cold build, leave the AST uncleaned for
       # re-green, and hand off to `run_watch_resident` after the first build.
       watch_resident = incr && watch? && !@no_codegen
-      m3_mode = m3a_mode || m3b_new || m3_fp || m3_resident || m3_dump_files || watch_resident
-      program.regreen = ReGreenEngine.new if m3a_mode || m3b_new || m3_resident || m3_dump_files || watch_resident
+      daemon_serve = incr && !daemon_serve_socket.nil? && !@no_codegen
+      m3_mode = m3a_mode || m3b_new || m3_fp || m3_resident || m3_dump_files || watch_resident || daemon_serve
+      program.regreen = ReGreenEngine.new if m3a_mode || m3b_new || m3_resident || m3_dump_files || watch_resident || daemon_serve
       node = parse program, source
 
       # M3 experiments disable main-node cleanup so re-green operates on raw
@@ -371,6 +384,11 @@ module Crystal
         return Result.new program, node
       end
 
+      if daemon_serve && (engine = program.regreen) && (sock = daemon_serve_socket)
+        run_daemon_resident(program, engine, node, source, output_filename, sock)
+        return Result.new program, node
+      end
+
       if (engine = program.regreen) && m3_resident
         run_m3_resident(program, engine, node, source)
       end
@@ -411,29 +429,8 @@ module Crystal
     # program matches disk again. Never stale by construction: every rebuild is
     # byte-identical to a cold build of that source, or IS a cold build.
     private def run_watch_resident(program, engine, node, sources, output_filename) : Nil
-      program.codegen_incremental = true
-      self.incremental_resident = true
-      # First build: clean + codegen the initial binary and capture the dead-
-      # external baseline the per-cycle codegen reset needs (externals dead since
-      # semantic — duplicate fun declarations — must stay dead across cycles).
-      cleaned = program.cleanup(node)
-      program.cleanup_types
-      program.cleanup_files
-      semantic_dead = ReGreenEngine.collect_dead_externals(cleaned)
-      m3_stabilize(program)
-      codegen program, cleaned, sources, output_filename
-
-      # Snapshot each watched file's CONTENT (the pre-edit source the gate diffs
-      # against — the file is edited in place) and mtime.
-      watched = Set(String).new
-      program.requires.each { |f| watched << f if File.file?(f) }
-      sources.each { |s| watched << s.filename if File.file?(s.filename) }
-      src = {} of String => String
-      mtime = {} of String => Time
-      watched.each do |f|
-        src[f] = File.read(f)
-        mtime[f] = File.info(f).modification_time
-      end
+      semantic_dead = regreen_first_build(program, node, sources, output_filename)
+      watched, src, mtime = regreen_snapshot(program, sources)
 
       child = (watch_argv || ARGV).reject { |a| a == "--watch" }
       child << "--incremental" unless child.includes?("--incremental")
@@ -441,58 +438,22 @@ module Crystal
       stderr.puts "[watch] watching #{watched.size} files — in-process re-green (Ctrl-C to stop)"
       loop do
         sleep 300.milliseconds
-        changed = [] of String
-        watched.each do |f|
-          info = File.info?(f)
-          next unless info
-          mt = info.modification_time
-          next if mtime[f]? == mt
-          mtime[f] = mt
-          changed << f
-        end
+        changed = regreen_changed(watched, mtime)
         next if changed.empty?
         names = changed.map { |f| File.basename(f) }.join(", ")
         stderr.print "[watch] #{Time.local.to_s("%H:%M:%S")} #{names} — "
         t0 = Time.instant
 
-        # Gate every changed file; the first one outside the body-only envelope
-        # (or a brand-new/removed file with no snapshot) forces a full rebuild.
-        seeds = Set(UInt64).new
-        in_envelope = changed.all? do |f|
-          old = src[f]?
-          if old && (s = m3_seeds_from_src(program, engine, old, File.read(f), f))
-            seeds.concat(s)
-            true
-          else
-            false
-          end
-        end
-
-        if in_envelope
-          n, errors, unsound = engine.reinfer_defs(program, seeds, node)
-          if errors == 0 && unsound == 0
-            cleaned = program.cleanup(node)
-            engine.last_regreen_instances.each { |inst| program.cleanup_transformer.cleanup_def(inst.typed_def) }
-            program.cleanup_types
-            program.cleanup_files
-            ReGreenEngine.reset_codegen_emission_state(program, cleaned, semantic_dead)
-            engine.fp_dirty_modules = engine.fp_dirty_modules_for(seeds)
-            m3_stabilize(program)
-            before_types = ReGreenEngine.materialized_type_ids(program)
-            codegen program, cleaned, sources, output_filename
-            engine.note_codegen_types(before_types, ReGreenEngine.materialized_type_ids(program))
-            changed.each { |f| src[f] = File.read(f) }
-            stderr.puts "re-green #{n} def(s) (#{(Time.instant - t0).total_seconds.round(2)}s)"
-            next
-          end
+        seeds, in_envelope = regreen_gate(program, engine, changed, src)
+        if in_envelope && (n = regreen_rebuild(program, engine, node, sources, output_filename, seeds, semantic_dead))
+          changed.each { |f| src[f] = File.read(f) }
+          stderr.puts "re-green #{n} def(s) (#{(Time.instant - t0).total_seconds.round(2)}s)"
+          next
         end
 
         # Out of envelope: a sound full rebuild, then re-exec `--watch` so the
-        # held program matches disk again. Flush the in-memory State first so the
-        # fallback subprocess reuses this session's warm `.o` cache.
-        if st = @resident_state
-          st.save(incremental_state_path(CacheDir.instance.directory_for(sources)))
-        end
+        # held program matches disk again.
+        flush_resident_state(sources)
         stderr.puts "full rebuild…"
         status = Process.run(exe, child, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
         dt = (Time.instant - t0).total_seconds.round(2)
@@ -503,6 +464,222 @@ module Crystal
           stderr.puts "[watch] FAILED (exit #{status.exit_code}, #{dt}s)"
         end
       end
+    end
+
+    # `--daemon-serve`: become the resident re-green server. Do the first build
+    # (warm the program + `.o` cache), then accept build requests on the unix
+    # socket — each re-greens the files changed since the last build and codegens
+    # to the requested output, identical to a `--watch` cycle but driven by a
+    # client instead of a poll. Out of envelope (or on any error), the reply tells
+    # the client to cold-build and the daemon exits so the next client spawns a
+    # fresh one resynced to the new source.
+    private def run_daemon_resident(program, engine, node, sources, output_filename, socket_path) : Nil
+      semantic_dead = regreen_first_build(program, node, sources, output_filename)
+      watched, src, mtime = regreen_snapshot(program, sources)
+
+      File.delete?(socket_path)
+      server = UNIXServer.new(socket_path)
+      stderr.puts "[daemon] serving #{watched.size} files on #{socket_path}"
+      loop do
+        conn = server.accept
+        handled = false
+        begin
+          request = conn.gets
+          if request && request.chomp.split('\t')[0]? == "BUILD"
+            out_path = request.chomp.split('\t')[1]? || output_filename
+            t0 = Time.instant
+            changed = regreen_changed(watched, mtime)
+            seeds, in_envelope = regreen_gate(program, engine, changed, src)
+            if in_envelope && (n = regreen_rebuild(program, engine, node, sources, out_path, seeds, semantic_dead))
+              changed.each { |f| src[f] = File.read(f) }
+              conn.puts "OK\t#{(Time.instant - t0).total_seconds.round(3)}\t#{n}"
+              handled = true
+            end
+          end
+        rescue ex
+          stderr.puts "[daemon] error: #{ex.message}"
+        ensure
+          (conn.puts "FALLBACK") rescue nil unless handled
+          conn.close rescue nil
+        end
+        # Out of envelope / error: exit so the next client spawns a daemon
+        # resynced to the changed source (mirrors `--watch`'s re-exec).
+        break unless handled
+      end
+      File.delete?(socket_path)
+    end
+
+    # Shared resident setup: the first in-process build (clean + codegen) plus the
+    # dead-external baseline the per-cycle codegen reset needs (externals dead
+    # since semantic — duplicate fun declarations — must stay dead across cycles).
+    private def regreen_first_build(program, node, sources, output_filename) : Set(UInt64)
+      program.codegen_incremental = true
+      self.incremental_resident = true
+      cleaned = program.cleanup(node)
+      program.cleanup_types
+      program.cleanup_files
+      semantic_dead = ReGreenEngine.collect_dead_externals(cleaned)
+      m3_stabilize(program)
+      codegen program, cleaned, sources, output_filename
+      semantic_dead
+    end
+
+    # Snapshot each watched file's CONTENT (the pre-edit source the gate diffs
+    # against — the file is edited in place) and mtime. Returns {watched, src, mtime}.
+    private def regreen_snapshot(program, sources)
+      watched = Set(String).new
+      program.requires.each { |f| watched << f if File.file?(f) }
+      sources.each { |s| watched << s.filename if File.file?(s.filename) }
+      src = {} of String => String
+      mtime = {} of String => Time
+      watched.each do |f|
+        src[f] = File.read(f)
+        mtime[f] = File.info(f).modification_time
+      end
+      {watched, src, mtime}
+    end
+
+    # Files whose mtime changed since the last snapshot (mutates *mtime*).
+    private def regreen_changed(watched, mtime) : Array(String)
+      changed = [] of String
+      watched.each do |f|
+        info = File.info?(f)
+        next unless info
+        mt = info.modification_time
+        next if mtime[f]? == mt
+        mtime[f] = mt
+        changed << f
+      end
+      changed
+    end
+
+    # Gate every changed file against the body-only re-green envelope, splicing
+    # the edited bodies. Returns {spliced seeds, all-in-envelope?}; a false flag
+    # (an edit outside the envelope, or a brand-new/removed file) means the caller
+    # must fall back to a cold build.
+    private def regreen_gate(program, engine, changed, src) : {Set(UInt64), Bool}
+      seeds = Set(UInt64).new
+      in_envelope = changed.all? do |f|
+        old = src[f]?
+        if old && (s = m3_seeds_from_src(program, engine, old, File.read(f), f))
+          seeds.concat(s)
+          true
+        else
+          false
+        end
+      end
+      {seeds, in_envelope}
+    end
+
+    # Re-green the spliced *seeds* and codegen to *output_filename* in process.
+    # Returns the number of re-greened def(s) on success, or nil if re-green hit
+    # errors/unsound nodes and the caller must fall back to a cold build.
+    private def regreen_rebuild(program, engine, node, sources, output_filename, seeds, semantic_dead) : Int32?
+      n, errors, unsound = engine.reinfer_defs(program, seeds, node)
+      return nil unless errors == 0 && unsound == 0
+      cleaned = program.cleanup(node)
+      engine.last_regreen_instances.each { |inst| program.cleanup_transformer.cleanup_def(inst.typed_def) }
+      program.cleanup_types
+      program.cleanup_files
+      ReGreenEngine.reset_codegen_emission_state(program, cleaned, semantic_dead)
+      engine.fp_dirty_modules = engine.fp_dirty_modules_for(seeds)
+      m3_stabilize(program)
+      before_types = ReGreenEngine.materialized_type_ids(program)
+      codegen program, cleaned, sources, output_filename
+      engine.note_codegen_types(before_types, ReGreenEngine.materialized_type_ids(program))
+      n
+    end
+
+    # Flush the in-memory incremental State to disk so a fallback subprocess
+    # build reuses this session's warm `.o` cache.
+    private def flush_resident_state(sources) : Nil
+      if st = @resident_state
+        st.save(incremental_state_path(CacheDir.instance.directory_for(sources)))
+      end
+    end
+
+    # Client side of `--daemon`: forward this build to a resident re-green daemon
+    # for a fast warm rebuild. Connects to the daemon's unix socket; on a
+    # successful reply the binary is already at *output_filename*. With no live
+    # daemon (or an out-of-envelope reply) it falls back to a normal cold
+    # `--incremental` build in this process, then spawns a daemon to warm the next.
+    def build_via_daemon(sources, output_filename) : Nil
+      socket_path = daemon_socket_path(sources)
+      if (reply = daemon_request(socket_path, output_filename)) && reply.starts_with?("OK")
+        secs = reply.split('\t')[1]?
+        stderr.puts "[daemon] re-green build (#{secs}s)"
+        return
+      end
+      compile sources, output_filename
+      spawn_daemon(socket_path)
+    end
+
+    # Per-(entry, flags, CRYSTAL_PATH) unix-socket path for the build daemon, in
+    # the runtime dir (short, to stay under the ~108-char sun_path limit). The
+    # output path (`-o`) and daemon flags are excluded: the same daemon serves
+    # builds to any output, so two `--daemon` builds that differ only in `-o`
+    # must hash to the same socket. `CRYSTAL_DAEMON_SOCKET` overrides for testing.
+    private def daemon_socket_path(sources) : String
+      if pinned = ENV["CRYSTAL_DAEMON_SOCKET"]?
+        return pinned
+      end
+      key = ::Crystal::Digest::MD5.hexdigest do |ctx|
+        ctx.update(File.expand_path(sources.first.filename))
+        ctx.update("\0")
+        daemon_identity_args.each { |a| ctx.update(a); ctx.update("\0") }
+        ctx.update(ENV["CRYSTAL_PATH"]? || "")
+      end
+      base = ENV["XDG_RUNTIME_DIR"]? || ENV["TMPDIR"]? || "/tmp"
+      File.join(base, "crystal-rgd-#{key[0, 16]}.sock")
+    end
+
+    # The invocation args that define a daemon's identity: everything except the
+    # output path and the daemon flags themselves (which don't change what's
+    # compiled, only where the binary lands / how it's driven).
+    private def daemon_identity_args : Array(String)
+      args = watch_argv || ARGV
+      result = [] of String
+      skip = false
+      args.each do |a|
+        if skip
+          skip = false
+          next
+        end
+        case a
+        when "--daemon"                         then next
+        when "-o", "--output", "--daemon-serve" then skip = true
+        else                                         result << a
+        end
+      end
+      result
+    end
+
+    # Send a BUILD request to the daemon at *socket_path*; nil if no daemon is
+    # listening, else its reply line ("OK\t<secs>\t<n>" / "FALLBACK" / "ERR…").
+    private def daemon_request(socket_path, output_filename) : String?
+      return nil unless File.exists?(socket_path)
+      conn = UNIXSocket.new(socket_path)
+      begin
+        conn << "BUILD\t#{File.expand_path(output_filename)}\n"
+        conn.flush
+        conn.gets
+      ensure
+        conn.close
+      end
+    rescue
+      nil
+    end
+
+    # Spawn a detached daemon to warm this build's program for the next request.
+    # Best-effort: a failure just means the next build is another cold one.
+    private def spawn_daemon(socket_path) : Nil
+      argv = (watch_argv || ARGV).reject { |a| a == "--daemon" }
+      argv << "--daemon-serve" << socket_path
+      exe = Process.executable_path || PROGRAM_NAME
+      log = File.open("#{socket_path}.log", "w")
+      Process.new(exe, argv, input: Process::Redirect::Close, output: log, error: log)
+    rescue ex
+      stderr.puts "[daemon] could not spawn: #{ex.message}"
     end
 
     # Phase-2 (M3) in-process re-green experiment. Computes the codegen

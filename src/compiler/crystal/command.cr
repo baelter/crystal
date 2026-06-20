@@ -275,7 +275,11 @@ class Crystal::Command
 
   private def build
     config = create_compiler "build"
-    config.compile
+    if config.compiler.daemon?
+      config.compiler.build_via_daemon(config.sources, config.output_filename)
+    else
+      config.compile
+    end
   end
 
   private def hierarchy
@@ -601,6 +605,15 @@ class Crystal::Command
           compiler.incremental = true
           compiler.watch = true
           compiler.watch_argv = original_args
+        end
+        opts.on("--daemon", "Experimental: build via a resident re-green daemon (implies --incremental)") do
+          compiler.incremental = true
+          compiler.daemon = true
+          compiler.watch_argv = original_args
+        end
+        opts.on("--daemon-serve PATH", "Internal: serve re-green builds as the daemon on unix socket PATH") do |path|
+          compiler.incremental = true
+          compiler.daemon_serve_socket = path
         end
         opts.on("--threads NUM", "Maximum number of threads to use") do |n_threads|
           compiler.n_threads = n_threads.to_i? || raise Error.new("Invalid thread count: #{n_threads}")
