@@ -430,7 +430,7 @@ module Crystal
     # byte-identical to a cold build of that source, or IS a cold build.
     private def run_watch_resident(program, engine, node, sources, output_filename) : Nil
       semantic_dead = regreen_first_build(program, engine, node, sources, output_filename)
-      watched, src, mtime = regreen_snapshot(program, sources)
+      watched, src, mtime, dir_set = regreen_snapshot(program, sources)
 
       child = (watch_argv || ARGV).reject { |a| a == "--watch" }
       child << "--incremental" unless child.includes?("--incremental")
@@ -439,13 +439,15 @@ module Crystal
       loop do
         sleep 300.milliseconds
         changed = regreen_changed(watched, mtime)
-        next if changed.empty?
+        structural = regreen_structural_change?(watched, dir_set)
+        next if changed.empty? && !structural
         names = changed.map { |f| File.basename(f) }.join(", ")
+        names = structural && names.empty? ? "(file added/removed)" : names
         stderr.print "[watch] #{Time.local.to_s("%H:%M:%S")} #{names} — "
         t0 = Time.instant
 
         seeds, in_envelope = regreen_gate(program, engine, changed, src)
-        if in_envelope && (n = regreen_rebuild(program, engine, node, sources, output_filename, seeds, semantic_dead))
+        if !structural && in_envelope && (n = regreen_rebuild(program, engine, node, sources, output_filename, seeds, semantic_dead))
           changed.each { |f| src[f] = File.read(f) }
           stderr.puts "re-green #{n} def(s) (#{(Time.instant - t0).total_seconds.round(2)}s)"
           next
@@ -475,7 +477,7 @@ module Crystal
     # fresh one resynced to the new source.
     private def run_daemon_resident(program, engine, node, sources, output_filename, socket_path) : Nil
       semantic_dead = regreen_first_build(program, engine, node, sources, output_filename)
-      watched, src, mtime = regreen_snapshot(program, sources)
+      watched, src, mtime, dir_set = regreen_snapshot(program, sources)
 
       File.delete?(socket_path)
       server = UNIXServer.new(socket_path)
@@ -489,8 +491,9 @@ module Crystal
             out_path = request.chomp.split('\t')[1]? || output_filename
             t0 = Time.instant
             changed = regreen_changed(watched, mtime)
+            structural = regreen_structural_change?(watched, dir_set)
             seeds, in_envelope = regreen_gate(program, engine, changed, src)
-            if in_envelope && (n = regreen_rebuild(program, engine, node, sources, out_path, seeds, semantic_dead))
+            if !structural && in_envelope && (n = regreen_rebuild(program, engine, node, sources, out_path, seeds, semantic_dead))
               changed.each { |f| src[f] = File.read(f) }
               conn.puts "OK\t#{(Time.instant - t0).total_seconds.round(3)}\t#{n}"
               handled = true
@@ -532,7 +535,10 @@ module Crystal
     end
 
     # Snapshot each watched file's CONTENT (the pre-edit source the gate diffs
-    # against — the file is edited in place) and mtime. Returns {watched, src, mtime}.
+    # against — the file is edited in place) and mtime, plus the `.cr` membership
+    # of every directory holding a required file (to catch new/removed files a
+    # glob `require` would pull in — `regreen_structural_change?`). Returns
+    # {watched, src, mtime, dir_set}.
     private def regreen_snapshot(program, sources)
       watched = Set(String).new
       program.requires.each { |f| watched << f if File.file?(f) }
@@ -543,7 +549,31 @@ module Crystal
         src[f] = File.read(f)
         mtime[f] = File.info(f).modification_time
       end
-      {watched, src, mtime}
+      dir_set = {} of String => Set(String)
+      watched.each do |f|
+        d = File.dirname(f)
+        dir_set[d] ||= cr_children(d)
+      end
+      {watched, src, mtime, dir_set}
+    end
+
+    private def cr_children(dir) : Set(String)
+      Dir.children(dir).select!(&.ends_with?(".cr")).to_set
+    rescue
+      Set(String).new
+    end
+
+    # True if the require closure's file set changed since the snapshot: a watched
+    # file was deleted, or a directory holding required files gained/lost a `.cr`
+    # (a glob `require "dir/*"` would then require a different set). A pure content
+    # edit changes neither, so this only fires on add/remove/rename — exactly the
+    # structural changes the body-only re-green envelope cannot absorb, forcing a
+    # sound fallback. Conservative: a new `.cr` in a directory that merely happens
+    # to hold a required file also fires, which is safe (an extra cold rebuild).
+    private def regreen_structural_change?(watched, dir_set) : Bool
+      watched.each { |f| return true unless File.file?(f) }
+      dir_set.each { |d, names| return true if cr_children(d) != names }
+      false
     end
 
     # Files whose mtime changed since the last snapshot (mutates *mtime*).
