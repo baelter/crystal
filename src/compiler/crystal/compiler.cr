@@ -429,7 +429,7 @@ module Crystal
     # program matches disk again. Never stale by construction: every rebuild is
     # byte-identical to a cold build of that source, or IS a cold build.
     private def run_watch_resident(program, engine, node, sources, output_filename) : Nil
-      semantic_dead = regreen_first_build(program, node, sources, output_filename)
+      semantic_dead = regreen_first_build(program, engine, node, sources, output_filename)
       watched, src, mtime = regreen_snapshot(program, sources)
 
       child = (watch_argv || ARGV).reject { |a| a == "--watch" }
@@ -474,7 +474,7 @@ module Crystal
     # the client to cold-build and the daemon exits so the next client spawns a
     # fresh one resynced to the new source.
     private def run_daemon_resident(program, engine, node, sources, output_filename, socket_path) : Nil
-      semantic_dead = regreen_first_build(program, node, sources, output_filename)
+      semantic_dead = regreen_first_build(program, engine, node, sources, output_filename)
       watched, src, mtime = regreen_snapshot(program, sources)
 
       File.delete?(socket_path)
@@ -512,7 +512,7 @@ module Crystal
     # Shared resident setup: the first in-process build (clean + codegen) plus the
     # dead-external baseline the per-cycle codegen reset needs (externals dead
     # since semantic — duplicate fun declarations — must stay dead across cycles).
-    private def regreen_first_build(program, node, sources, output_filename) : Set(UInt64)
+    private def regreen_first_build(program, engine, node, sources, output_filename) : Set(UInt64)
       program.codegen_incremental = true
       self.incremental_resident = true
       cleaned = program.cleanup(node)
@@ -520,7 +520,14 @@ module Crystal
       program.cleanup_files
       semantic_dead = ReGreenEngine.collect_dead_externals(cleaned)
       m3_stabilize(program)
+      # Record the types THIS first codegen lazily materializes (unions,
+      # metaclasses), exactly as each re-green cycle does. A cold build mints them
+      # after its pin/epoch snapshot, so the next cycle must exclude them to match
+      # it; without this they pollute the next cycle's pin/fingerprint and the warm
+      # binary diverges from cold at scale (functional but byte-different).
+      before_types = ReGreenEngine.materialized_type_ids(program)
       codegen program, cleaned, sources, output_filename
+      engine.note_codegen_types(before_types, ReGreenEngine.materialized_type_ids(program))
       semantic_dead
     end
 
