@@ -68,6 +68,11 @@ module Crystal
     # If `true`, error messages can be colorized
     property? color = true
 
+    # If `true`, codegen is running an incremental (`--incremental`) build, so
+    # `Def#mangled_name` folds in the structural DefId disambiguator. Off for
+    # normal builds, keeping their symbol names (and output) unchanged.
+    property? codegen_incremental = false
+
     # All required files. The set stores absolute files. This way
     # files loaded by `require` nodes are only processed once.
     getter requires = Set(String).new
@@ -76,6 +81,38 @@ module Crystal
     # (see `Crystal::SemanticDependencyTracker`). `nil` during ordinary
     # compilation, so there is no overhead unless explicitly requested.
     property semantic_dependencies : SemanticDependencyTracker? = nil
+
+    # When set, type inference records def-instance-level caller->callee edges
+    # into it (see `Crystal::SemanticGraph`) for incremental semantic analysis.
+    # `nil` during ordinary compilation, so there is no overhead unless requested.
+    property semantic_graph : SemanticGraph? = nil
+
+    # When set, the in-process re-green engine (phase 2, M3) records every fresh
+    # method instantiation so a subset can be torn down and re-inferred. See
+    # `Crystal::ReGreenEngine`; activated by env `CRYSTAL_M3`. `nil` otherwise.
+    property regreen : ReGreenEngine? = nil
+
+    # Incremental codegen: the live/reachable function set produced by the last
+    # `codegen` call (type-module name => mangled names emitted with a body).
+    # Persisted so the next build can seed pruned-but-live functions.
+    property codegen_live_funs : Hash(String, Set(String))? = nil
+
+    # Incremental codegen: outputs of the last `codegen` call needed to persist
+    # incremental state — the lazily-emitted main-resident helper ledger, the
+    # proc-thunk replay payloads (in-memory, this run), the eager main symbol
+    # snapshot, and the pinned type_id table.
+    property codegen_main_symbols : Array(IncrementalCodegen::MainSymbolRecord)? = nil
+    property codegen_proc_thunks : Hash(String, {Def, Type, Bool})? = nil
+    property codegen_eager_main : Array(String)? = nil
+    property codegen_type_id_table : Hash(String, Int32)? = nil
+
+    # Incremental codegen: cross-module inline edges (caller type-module name =>
+    # the type-module names whose trivial method bodies it inlined). A reused
+    # `.o` embeds those bodies, so if a callee module's fingerprint changes the
+    # caller must regenerate even though its own fingerprint is unchanged —
+    # `IncrementalCodegen.reusable` enforces this. Without it a body edit to an
+    # inlined leaf would leave a stale literal in every skipped caller.
+    property codegen_inline_deps : Hash(String, Set(String))? = nil
 
     # All created unions in a program, indexed by an array of opaque
     # ids of each type in the union. The array (the key) is sorted

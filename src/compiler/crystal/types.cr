@@ -126,6 +126,20 @@ module Crystal
       metaclass
     end
 
+    # The metaclass if one has already been created, WITHOUT forcing creation —
+    # the read-only counterpart of `metaclass`, mirroring `virtual_type?`. The
+    # incremental fingerprint walk uses this so computing the fingerprint stays a
+    # pure read: calling the lazy `metaclass` getter would materialize a never-
+    # demanded metaclass type, which then receives a type_id and perturbs the
+    # emitted type tables — breaking byte identity between a cold single-pass
+    # build and a resident build that fingerprints repeatedly. Metaclasses that
+    # real code uses already exist (typing `T.class` created them), so they are
+    # still returned and walked. Overridden by the metaclass types, whose own
+    # metaclass is the always-present `program.class_type` (never lazily made).
+    def existing_metaclass : Type?
+      @metaclass
+    end
+
     # Initializes a metaclass.
     # Some subtypes (classes) add an `allocate` method so a class can be instantiated.
     protected def initialize_metaclass(metaclass)
@@ -227,6 +241,12 @@ module Crystal
 
     def virtual_type!
       self
+    end
+
+    # The already-created virtual type, if any, without forcing creation.
+    # Overridden by `ClassType`/`GenericClassInstanceType` to return `@virtual_type`.
+    def virtual_type?
+      nil
     end
 
     def instance_type
@@ -1299,6 +1319,11 @@ module Crystal
       @virtual_type ||= VirtualType.new(program, self)
     end
 
+    # The already-created virtual type, if any, without forcing creation.
+    def virtual_type?
+      @virtual_type
+    end
+
     def class?
       true
     end
@@ -2163,6 +2188,11 @@ module Crystal
       @virtual_type ||= VirtualType.new(program, self)
     end
 
+    # The already-created virtual type, if any, without forcing creation.
+    def virtual_type?
+      @virtual_type
+    end
+
     delegate depth, defs, superclass, macros, abstract?, struct?,
       type_desc, namespace, lookup_new_in_ancestors?,
       splat_index, double_variadic?, to: @generic_type
@@ -2918,6 +2948,10 @@ module Crystal
       program.class_type
     end
 
+    def existing_metaclass : Type?
+      program.class_type
+    end
+
     delegate abstract?, generic_nest, lookup_new_in_ancestors?,
       type_var?, to: instance_type
 
@@ -2970,6 +3004,10 @@ module Crystal
     end
 
     def metaclass
+      program.class_type
+    end
+
+    def existing_metaclass : Type?
       program.class_type
     end
 
@@ -3044,6 +3082,10 @@ module Crystal
     end
 
     def metaclass
+      program.class_type
+    end
+
+    def existing_metaclass : Type?
       program.class_type
     end
 
@@ -3498,6 +3540,10 @@ module Crystal
     end
 
     def metaclass
+      program.class_type
+    end
+
+    def existing_metaclass : Type?
       program.class_type
     end
 

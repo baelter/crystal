@@ -77,7 +77,13 @@ class Crystal::Command
   private getter options
   @compiler : Compiler?
 
+  # Snapshot of the invocation args BEFORE option parsing consumes them — used
+  # to reconstruct the child build command for `--watch` (the parser mutates
+  # `options` in place, so it can't be read back later).
+  getter original_args : Array(String)
+
   def initialize(@options : Array(String))
+    @original_args = @options.dup
     @color = Colorize.default_enabled?(STDOUT, STDERR)
     @error_trace = false
     @progress_tracker = ProgressTracker.new
@@ -269,7 +275,11 @@ class Crystal::Command
 
   private def build
     config = create_compiler "build"
-    config.compile
+    if config.compiler.daemon?
+      config.compiler.build_via_daemon(config.sources, config.output_filename)
+    else
+      config.compile
+    end
   end
 
   private def hierarchy
@@ -587,6 +597,23 @@ class Crystal::Command
       unless no_codegen
         opts.on("--single-module", "Generate a single LLVM module") do
           compiler.single_module = true
+        end
+        opts.on("--incremental", "Experimental: reuse cached IR for unchanged type-modules") do
+          compiler.incremental = true
+        end
+        opts.on("--watch", "Experimental: rebuild on source change (implies --incremental)") do
+          compiler.incremental = true
+          compiler.watch = true
+          compiler.watch_argv = original_args
+        end
+        opts.on("--daemon", "Experimental: build via a resident re-green daemon (implies --incremental)") do
+          compiler.incremental = true
+          compiler.daemon = true
+          compiler.watch_argv = original_args
+        end
+        opts.on("--daemon-serve PATH", "Internal: serve re-green builds as the daemon on unix socket PATH") do |path|
+          compiler.incremental = true
+          compiler.daemon_serve_socket = path
         end
         opts.on("--threads NUM", "Maximum number of threads to use") do |n_threads|
           compiler.n_threads = n_threads.to_i? || raise Error.new("Invalid thread count: #{n_threads}")

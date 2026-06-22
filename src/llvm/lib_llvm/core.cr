@@ -156,6 +156,8 @@ lib LibLLVM
   {% else %}
     fun get_named_global_with_length = LLVMGetNamedGlobalWithLength(m : ModuleRef, name : Char*, length : SizeT) : ValueRef
   {% end %}
+  fun get_first_global = LLVMGetFirstGlobal(m : ModuleRef) : ValueRef
+  fun get_next_global = LLVMGetNextGlobal(global_var : ValueRef) : ValueRef
   fun get_initializer = LLVMGetInitializer(global_var : ValueRef) : ValueRef
   fun set_initializer = LLVMSetInitializer(global_var : ValueRef, constant_val : ValueRef)
   fun is_thread_local = LLVMIsThreadLocal(global_var : ValueRef) : Bool
@@ -212,6 +214,7 @@ lib LibLLVM
 
   fun create_builder_in_context = LLVMCreateBuilderInContext(c : ContextRef) : BuilderRef
   fun position_builder_at_end = LLVMPositionBuilderAtEnd(builder : BuilderRef, block : BasicBlockRef)
+  fun position_builder_before = LLVMPositionBuilderBefore(builder : BuilderRef, instr : ValueRef)
   fun get_insert_block = LLVMGetInsertBlock(builder : BuilderRef) : BasicBlockRef
   fun dispose_builder = LLVMDisposeBuilder(builder : BuilderRef)
 

@@ -152,6 +152,10 @@ module Crystal
 
     def type_class_var(target, node, value)
       owner = class_var_owner(target)
+      if graph = program.semantic_graph
+        fp = ::Crystal::Digest::MD5.hexdigest { |c| c.update(value.to_s) }[0, 12]
+        graph.record_cvar_init(owner, target.name, fp)
+      end
       cvars = @class_vars[owner] ||= {} of String => {ASTNode, ASTNode}
       existing = cvars[target.name]?
       cvars[target.name] = {node.as(ASTNode), value}

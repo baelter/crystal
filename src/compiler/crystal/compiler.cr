@@ -1,6 +1,7 @@
 require "option_parser"
 require "file_utils"
 require "colorize"
+require "socket"
 require "crystal/digest/md5"
 {% if flag?(:msvc) %}
   require "./loader"
@@ -222,6 +223,48 @@ module Crystal
     # semantic-dependencies`.
     property semantic_dependencies : SemanticDependencyTracker? = nil
 
+    # Experimental: skip regenerating LLVM IR for type-modules whose typed
+    # definitions are unchanged since the last build, linking their cached `.o`
+    # directly. See `Crystal::IncrementalCodegen`. Off by default.
+    property? incremental = false
+
+    # Experimental `--watch`: after the first build, watch the required source
+    # files and re-run an `--incremental` build (a child process, so each rebuild
+    # is a fresh, sound, never-stale build) whenever one changes. Off by default.
+    property? watch = false
+
+    # The original invocation args (captured before option parsing consumed
+    # them) used to reconstruct the child build command in `run_watch` and to
+    # spawn the re-green daemon.
+    property watch_argv : Array(String)? = nil
+
+    # Experimental `--daemon`: a one-shot `crystal build --daemon` that forwards
+    # the build to a resident re-green server (spawning one on first use), so a
+    # plain CLI build gets the warm-rebuild speed without an interactive `--watch`.
+    property? daemon = false
+
+    # Internal: when set (`--daemon-serve PATH`), this process IS the daemon —
+    # after the first build it holds the typed program and serves re-green builds
+    # over the unix socket at PATH instead of exiting.
+    property daemon_serve_socket : String? = nil
+
+    # Set while a resident re-green loop drives repeated codegens in one process
+    # (`run_watch_resident` / `run_m3_resident`). Lets `codegen` carry the
+    # incremental `State` in memory across cycles instead of round-tripping the
+    # multi-MB JSON to disk every cycle (the resident is its only consumer).
+    property? incremental_resident = false
+
+    # The incremental `State` built by the previous resident cycle, reused as the
+    # next cycle's `prev_state` in memory (skips `State.load`); nil before the
+    # first codegen. The `.o` files it references are still on disk.
+    property resident_state : IncrementalCodegen::State? = nil
+
+    # Per-codegen incremental bookkeeping timings (ms), read by the resident loop
+    # for its per-cycle breakdown.
+    property inc_t_load = 0.0
+    property inc_t_compute = 0.0
+    property inc_t_save = 0.0
+
     # Program that was created for the last compilation.
     property! program : Program
 
@@ -244,12 +287,127 @@ module Crystal
       source = [source] unless source.is_a?(Array)
       program = new_program(source)
       yield program
+      # Experimental incremental-semantic graph (phase 2): record def-level
+      # caller->callee edges during inference, dump after semantic. Off unless
+      # CRYSTAL_SEM_GRAPH is set, so ordinary builds are unaffected.
+      sem_graph_path = ENV["CRYSTAL_SEM_GRAPH"]?
+      program.semantic_graph = SemanticGraph.new if sem_graph_path
+      # Phase-2 (M3) incremental-semantic experiments. Cleanup is disabled in
+      # these modes so the fingerprint reflects raw inference output (cleanup is
+      # a separate post-pass not re-run by partial re-inference), keeping the
+      # warm/cold comparison fair. Modes (env, off by default):
+      #   CRYSTAL_M3=a     — M3a idempotence: re-infer a subset, assert unchanged
+      #   CRYSTAL_M3B_NEW  — M3b re-green: splice an edited source, re-infer, dump
+      #   CRYSTAL_M3_FP    — dump the cold fingerprint (ground truth) and exit
+      # M3 modes are an INCREMENTAL-only experiment (they compare against a cold
+      # `--incremental` build). Gate activation on `incremental?` so a nested
+      # macro-`run` host compilation (e.g. ECR's `{{ run("ecr/process") }}`,
+      # triggered on a cold cache) — which is a fresh non-incremental `Compiler`
+      # that inherits the `CRYSTAL_M3_*` env — does NOT enter the experiment path
+      # and `exit 0`, hijacking the parent build.
+      incr = incremental?
+      m3a_mode = incr ? ENV["CRYSTAL_M3"]? : nil
+      m3b_new = incr ? ENV["CRYSTAL_M3B_NEW"]? : nil
+      m3_fp = incr ? ENV["CRYSTAL_M3_FP"]? : nil
+      m3_noexit = incr ? ENV["CRYSTAL_M3_NOEXIT"]? : nil
+      m3_resident = incr ? ENV["CRYSTAL_M3_RESIDENT"]? : nil
+      m3_dump_files = incr ? ENV["CRYSTAL_M3_DUMP_FILES"]? : nil
+      # `--watch` drives the in-process re-green resident loop by default (no env):
+      # record instantiations during this cold build, leave the AST uncleaned for
+      # re-green, and hand off to `run_watch_resident` after the first build.
+      watch_resident = incr && watch? && !@no_codegen
+      daemon_serve = incr && !daemon_serve_socket.nil? && !@no_codegen
+      m3_mode = m3a_mode || m3b_new || m3_fp || m3_resident || m3_dump_files || watch_resident || daemon_serve
+      program.regreen = ReGreenEngine.new if m3a_mode || m3b_new || m3_resident || m3_dump_files || watch_resident || daemon_serve
       node = parse program, source
 
+      # M3 experiments disable main-node cleanup so re-green operates on raw
+      # inference output (cleanup is a post-pass that partial re-inference does
+      # not re-run); the NOEXIT binary-equivalence experiment runs cleanup AFTER
+      # re-green (below), matching the real feature's order (re-green is part of
+      # inference, cleanup follows), then proceeds to codegen.
       begin
-        node = program.semantic node, cleanup: !no_cleanup?
+        node = program.semantic node, cleanup: (m3_mode ? false : !no_cleanup?)
       rescue ex : SkipMacroCodeCoverageException
         program.macro_expansion_error_hook.try &.call(ex.cause)
+      end
+
+      if (graph = program.semantic_graph) && (path = sem_graph_path)
+        File.open(path, "w") { |f| graph.dump(program, f) }
+      end
+
+      if (engine = program.regreen) && m3_dump_files
+        # Diagnostic: histogram of files holding instantiated, cached (re-green-
+        # eligible) templates, so a self-build edit can target a method that
+        # actually re-greens. Counts distinct (line:col:name) defs per file.
+        only = m3_dump_files == "1" ? nil : m3_dump_files
+        if only
+          # Per-method dump for files whose path contains the given substring:
+          # exact (line:col:name) of every recorded, re-green-eligible template.
+          seen = Set(String).new
+          engine.instances.each do |i|
+            fn = i.untyped_def.location.try(&.filename)
+            next unless fn.is_a?(String) && fn.includes?(only)
+            key = ReGreenEngine.loc_key(i.untyped_def)
+            next unless key
+            stderr.puts "[m3def] #{key}" if seen.add?(key)
+          end
+        else
+          hist = Hash(String, Int32).new(0)
+          seen = Set({String, String}).new
+          engine.instances.each do |i|
+            fn = i.untyped_def.location.try(&.filename)
+            next unless fn.is_a?(String)
+            key = ReGreenEngine.loc_key(i.untyped_def)
+            next unless key
+            hist[fn] += 1 if seen.add?({fn, key})
+          end
+          hist.to_a.sort_by! { |_, n| -n }.first(40).each do |fn, n|
+            stderr.puts "[m3files] #{n}\t#{fn}"
+          end
+        end
+        exit 0
+      end
+
+      if path = m3_fp
+        program.codegen_incremental = true
+        m3_stabilize(program) # settle the walk's lazy type materialization
+        m3_dump_fp(IncrementalCodegen.compute(program), path)
+        if reach_path = ENV["CRYSTAL_M3_REACH"]?
+          File.write(reach_path, m3_reach(program, node).to_a.sort!.join('\n'))
+        end
+        exit 0
+      end
+
+      if watch_resident && (engine = program.regreen)
+        run_watch_resident(program, engine, node, source, output_filename)
+        return Result.new program, node
+      end
+
+      if daemon_serve && (engine = program.regreen) && (sock = daemon_serve_socket)
+        run_daemon_resident(program, engine, node, source, output_filename, sock)
+        return Result.new program, node
+      end
+
+      if (engine = program.regreen) && m3_resident
+        run_m3_resident(program, engine, node, source)
+      end
+
+      if (engine = program.regreen) && (new_path = m3b_new) && !m3_resident
+        run_m3b_experiment(program, engine, new_path, source.first.filename, node)
+      end
+
+      if (engine = program.regreen) && !m3b_new && !m3_resident
+        run_m3_experiment(program, engine, node)
+      end
+
+      # NOEXIT binary-equivalence experiment: re-green ran on the uncleaned
+      # program above; now run the normal cleanup pass (as the real feature
+      # would, after inference) so codegen can proceed.
+      if m3_noexit && program.regreen
+        node = program.cleanup(node)
+        program.cleanup_types
+        program.cleanup_files
       end
 
       units = codegen program, node, source, output_filename unless @no_codegen
@@ -259,6 +417,736 @@ module Crystal
       print_codegen_stats(units)
 
       Result.new program, node
+    end
+
+    # `--watch`: hold the typed program in memory after the first build and, on
+    # each source change, re-green only the edited method bodies and re-run
+    # `--incremental` codegen IN PROCESS — the semantic-amortizing fast rebuild.
+    # Any edit outside the body-only splice envelope (a signature/def-set change,
+    # a const/top-level edit, a new or removed `require`), or a re-green that
+    # can't reproduce the cold result, falls back to a fresh `crystal build
+    # --incremental` subprocess and then re-execs `--watch` so the resident
+    # program matches disk again. Never stale by construction: every rebuild is
+    # byte-identical to a cold build of that source, or IS a cold build.
+    private def run_watch_resident(program, engine, node, sources, output_filename) : Nil
+      semantic_dead = regreen_first_build(program, engine, node, sources, output_filename)
+      watched, src, mtime, dir_set, glob_set = regreen_snapshot(program, sources)
+
+      child = (watch_argv || ARGV).reject { |a| a == "--watch" }
+      child << "--incremental" unless child.includes?("--incremental")
+      exe = Process.executable_path || PROGRAM_NAME
+      stderr.puts "[watch] watching #{watched.size} files — in-process re-green (Ctrl-C to stop)"
+      loop do
+        sleep 300.milliseconds
+        changed = regreen_changed(watched, mtime)
+        structural = regreen_structural_change?(program, watched, dir_set, glob_set)
+        next if changed.empty? && !structural
+        names = changed.map { |f| File.basename(f) }.join(", ")
+        names = structural && names.empty? ? "(file added/removed)" : names
+        stderr.print "[watch] #{Time.local.to_s("%H:%M:%S")} #{names} — "
+        t0 = Time.instant
+
+        seeds, in_envelope = regreen_gate(program, engine, changed, src)
+        if !structural && in_envelope && (n = regreen_rebuild(program, engine, node, sources, output_filename, seeds, semantic_dead))
+          changed.each { |f| src[f] = File.read(f) }
+          stderr.puts "re-green #{n} def(s) (#{(Time.instant - t0).total_seconds.round(2)}s)"
+          next
+        end
+
+        # Out of envelope: a sound full rebuild, then re-exec `--watch` so the
+        # held program matches disk again.
+        flush_resident_state(sources)
+        stderr.puts "full rebuild…"
+        status = Process.run(exe, child, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
+        dt = (Time.instant - t0).total_seconds.round(2)
+        if status.success?
+          stderr.puts "[watch] ok (#{dt}s) — reloading"
+          Process.exec(exe, watch_argv || ARGV)
+        else
+          stderr.puts "[watch] FAILED (exit #{status.exit_code}, #{dt}s)"
+        end
+      end
+    end
+
+    # `--daemon-serve`: become the resident re-green server. Do the first build
+    # (warm the program + `.o` cache), then accept build requests on the unix
+    # socket — each re-greens the files changed since the last build and codegens
+    # to the requested output, identical to a `--watch` cycle but driven by a
+    # client instead of a poll. Out of envelope (or on any error), the reply tells
+    # the client to cold-build and the daemon exits so the next client spawns a
+    # fresh one resynced to the new source.
+    private def run_daemon_resident(program, engine, node, sources, output_filename, socket_path) : Nil
+      semantic_dead = regreen_first_build(program, engine, node, sources, output_filename)
+      watched, src, mtime, dir_set, glob_set = regreen_snapshot(program, sources)
+
+      File.delete?(socket_path)
+      server = UNIXServer.new(socket_path)
+      stderr.puts "[daemon] serving #{watched.size} files on #{socket_path}"
+      loop do
+        conn = server.accept
+        handled = false
+        begin
+          request = conn.gets
+          if request && request.chomp.split('\t')[0]? == "BUILD"
+            out_path = request.chomp.split('\t')[1]? || output_filename
+            t0 = Time.instant
+            changed = regreen_changed(watched, mtime)
+            structural = regreen_structural_change?(program, watched, dir_set, glob_set)
+            seeds, in_envelope = regreen_gate(program, engine, changed, src)
+            if !structural && in_envelope && (n = regreen_rebuild(program, engine, node, sources, out_path, seeds, semantic_dead))
+              changed.each { |f| src[f] = File.read(f) }
+              conn.puts "OK\t#{(Time.instant - t0).total_seconds.round(3)}\t#{n}"
+              handled = true
+            end
+          end
+        rescue ex
+          stderr.puts "[daemon] error: #{ex.message}"
+        ensure
+          (conn.puts "FALLBACK") rescue nil unless handled
+          conn.close rescue nil
+        end
+        # Out of envelope / error: exit so the next client spawns a daemon
+        # resynced to the changed source (mirrors `--watch`'s re-exec).
+        break unless handled
+      end
+      File.delete?(socket_path)
+    end
+
+    # Shared resident setup: the first in-process build (clean + codegen) plus the
+    # dead-external baseline the per-cycle codegen reset needs (externals dead
+    # since semantic — duplicate fun declarations — must stay dead across cycles).
+    private def regreen_first_build(program, engine, node, sources, output_filename) : Set(UInt64)
+      program.codegen_incremental = true
+      self.incremental_resident = true
+      cleaned = program.cleanup(node)
+      program.cleanup_types
+      program.cleanup_files
+      semantic_dead = ReGreenEngine.collect_dead_externals(cleaned)
+      m3_stabilize(program)
+      # Record the types THIS first codegen lazily materializes (unions,
+      # metaclasses), exactly as each re-green cycle does. A cold build mints them
+      # after its pin/epoch snapshot, so the next cycle must exclude them to match
+      # it; without this they pollute the next cycle's pin/fingerprint and the warm
+      # binary diverges from cold at scale (functional but byte-different).
+      before_types = ReGreenEngine.materialized_type_ids(program)
+      codegen program, cleaned, sources, output_filename
+      engine.note_codegen_types(before_types, ReGreenEngine.materialized_type_ids(program))
+      semantic_dead
+    end
+
+    # Snapshot each watched file's CONTENT (the pre-edit source the gate diffs
+    # against — the file is edited in place) and mtime, plus the `.cr` membership
+    # of every directory holding a required file (to catch new/removed files a
+    # glob `require` would pull in — `regreen_structural_change?`). Returns
+    # {watched, src, mtime, dir_set}.
+    private def regreen_snapshot(program, sources)
+      watched = Set(String).new
+      program.requires.each { |f| watched << f if File.file?(f) }
+      sources.each { |s| watched << s.filename if File.file?(s.filename) }
+      src = {} of String => String
+      mtime = {} of String => Time
+      watched.each do |f|
+        src[f] = File.read(f)
+        mtime[f] = File.info(f).modification_time
+      end
+      dir_set = {} of String => Set(String)
+      watched.each do |f|
+        d = File.dirname(f)
+        dir_set[d] ||= cr_children(d)
+      end
+      glob_set = {} of String => Set(String)
+      glob_require_dirs(program).each { |base, rec| glob_set[base] = glob_cr_set(base, rec) }
+      {watched, src, mtime, dir_set, glob_set}
+    end
+
+    private def cr_children(dir) : Set(String)
+      Dir.children(dir).select!(&.ends_with?(".cr")).to_set
+    rescue
+      Set(String).new
+    end
+
+    # Base directory => recursive? for every glob `require` (`dir/*` or `dir/**`),
+    # resolved exactly as `CrystalPath` does (relative to the requiring file). A
+    # `*` glob's directory is also covered by `dir_set`, but a `**` glob can pull
+    # files from subdirectories that hold no watched file at snapshot time — those
+    # are invisible to `dir_set`, so we track the glob's whole subtree separately.
+    private def glob_require_dirs(program) : Hash(String, Bool)
+      dirs = {} of String => Bool
+      program.recorded_requires.each do |rr|
+        fn = rr.filename
+        recursive = fn.ends_with?("/**")
+        next unless recursive || fn.ends_with?("/*")
+        next unless rel = rr.relative_to
+        # relative_to is the requiring file's path; CrystalPath#find dirnames it.
+        dir_part = fn[0..fn.rindex!('/')]
+        base = File.expand_path("#{File.dirname(rel)}/#{dir_part}")
+        next unless File.directory?(base)
+        dirs[base] = recursive || dirs.fetch(base, false)
+      end
+      dirs
+    end
+
+    # The `.cr` files a glob currently matches (recursive walk for `**`).
+    private def glob_cr_set(base : String, recursive : Bool) : Set(String)
+      acc = Set(String).new
+      walk_cr_files(base, recursive, acc)
+      acc
+    end
+
+    private def walk_cr_files(dir, recursive, acc) : Nil
+      Dir.each_child(dir) do |name|
+        full = File.join(dir, name)
+        if File.directory?(full)
+          walk_cr_files(full, recursive, acc) if recursive
+        elsif name.ends_with?(".cr")
+          acc << full
+        end
+      end
+    rescue
+    end
+
+    # True if the require closure's file set changed since the snapshot: a watched
+    # file was deleted, or a directory holding required files gained/lost a `.cr`
+    # (a glob `require "dir/*"` would then require a different set). A pure content
+    # edit changes neither, so this only fires on add/remove/rename — exactly the
+    # structural changes the body-only re-green envelope cannot absorb, forcing a
+    # sound fallback. Conservative: a new `.cr` in a directory that merely happens
+    # to hold a required file also fires, which is safe (an extra cold rebuild).
+    private def regreen_structural_change?(program, watched, dir_set, glob_set) : Bool
+      watched.each { |f| return true unless File.file?(f) }
+      dir_set.each { |d, names| return true if cr_children(d) != names }
+      glob_require_dirs(program).each do |base, rec|
+        return true if (glob_set[base]? || Set(String).new) != glob_cr_set(base, rec)
+      end
+      glob_set.each_key { |base| return true unless File.directory?(base) }
+      false
+    end
+
+    # Files whose mtime changed since the last snapshot (mutates *mtime*).
+    private def regreen_changed(watched, mtime) : Array(String)
+      changed = [] of String
+      watched.each do |f|
+        info = File.info?(f)
+        next unless info
+        mt = info.modification_time
+        next if mtime[f]? == mt
+        mtime[f] = mt
+        changed << f
+      end
+      changed
+    end
+
+    # Gate every changed file against the body-only re-green envelope, splicing
+    # the edited bodies. Returns {spliced seeds, all-in-envelope?}; a false flag
+    # (an edit outside the envelope, or a brand-new/removed file) means the caller
+    # must fall back to a cold build.
+    private def regreen_gate(program, engine, changed, src) : {Set(UInt64), Bool}
+      seeds = Set(UInt64).new
+      in_envelope = changed.all? do |f|
+        old = src[f]?
+        if old && (s = m3_seeds_from_src(program, engine, old, File.read(f), f))
+          seeds.concat(s)
+          true
+        else
+          false
+        end
+      end
+      {seeds, in_envelope}
+    end
+
+    # Re-green the spliced *seeds* and codegen to *output_filename* in process.
+    # Returns the number of re-greened def(s) on success, or nil if re-green hit
+    # errors/unsound nodes and the caller must fall back to a cold build.
+    private def regreen_rebuild(program, engine, node, sources, output_filename, seeds, semantic_dead) : Int32?
+      n, errors, unsound = engine.reinfer_defs(program, seeds, node)
+      return nil unless errors == 0 && unsound == 0
+      cleaned = program.cleanup(node)
+      engine.last_regreen_instances.each { |inst| program.cleanup_transformer.cleanup_def(inst.typed_def) }
+      program.cleanup_types
+      program.cleanup_files
+      ReGreenEngine.reset_codegen_emission_state(program, cleaned, semantic_dead)
+      engine.fp_dirty_modules = engine.fp_dirty_modules_for(seeds)
+      m3_stabilize(program)
+      before_types = ReGreenEngine.materialized_type_ids(program)
+      codegen program, cleaned, sources, output_filename
+      engine.note_codegen_types(before_types, ReGreenEngine.materialized_type_ids(program))
+      n
+    end
+
+    # Flush the in-memory incremental State to disk so a fallback subprocess
+    # build reuses this session's warm `.o` cache.
+    private def flush_resident_state(sources) : Nil
+      if st = @resident_state
+        st.save(incremental_state_path(CacheDir.instance.directory_for(sources)))
+      end
+    end
+
+    # Client side of `--daemon`: forward this build to a resident re-green daemon
+    # for a fast warm rebuild. Connects to the daemon's unix socket; on a
+    # successful reply the binary is already at *output_filename*. With no live
+    # daemon (or an out-of-envelope reply) it falls back to a normal cold
+    # `--incremental` build in this process, then spawns a daemon to warm the next.
+    def build_via_daemon(sources, output_filename) : Nil
+      socket_path = daemon_socket_path(sources)
+      if (reply = daemon_request(socket_path, output_filename)) && reply.starts_with?("OK")
+        secs = reply.split('\t')[1]?
+        stderr.puts "[daemon] re-green build (#{secs}s)"
+        return
+      end
+      compile sources, output_filename
+      spawn_daemon(socket_path)
+    end
+
+    # Per-(entry, flags, CRYSTAL_PATH) unix-socket path for the build daemon, in
+    # the runtime dir (short, to stay under the ~108-char sun_path limit). The
+    # output path (`-o`) and daemon flags are excluded: the same daemon serves
+    # builds to any output, so two `--daemon` builds that differ only in `-o`
+    # must hash to the same socket. `CRYSTAL_DAEMON_SOCKET` overrides for testing.
+    private def daemon_socket_path(sources) : String
+      if pinned = ENV["CRYSTAL_DAEMON_SOCKET"]?
+        return pinned
+      end
+      key = ::Crystal::Digest::MD5.hexdigest do |ctx|
+        ctx.update(File.expand_path(sources.first.filename))
+        ctx.update("\0")
+        daemon_identity_args.each { |a| ctx.update(a); ctx.update("\0") }
+        ctx.update(ENV["CRYSTAL_PATH"]? || "")
+      end
+      base = ENV["XDG_RUNTIME_DIR"]? || ENV["TMPDIR"]? || "/tmp"
+      File.join(base, "crystal-rgd-#{key[0, 16]}.sock")
+    end
+
+    # The invocation args that define a daemon's identity: everything except the
+    # output path and the daemon flags themselves (which don't change what's
+    # compiled, only where the binary lands / how it's driven).
+    private def daemon_identity_args : Array(String)
+      args = watch_argv || ARGV
+      result = [] of String
+      skip = false
+      args.each do |a|
+        if skip
+          skip = false
+          next
+        end
+        case a
+        when "--daemon"                         then next
+        when "-o", "--output", "--daemon-serve" then skip = true
+        else                                         result << a
+        end
+      end
+      result
+    end
+
+    # Send a BUILD request to the daemon at *socket_path*; nil if no daemon is
+    # listening, else its reply line ("OK\t<secs>\t<n>" / "FALLBACK" / "ERR…").
+    private def daemon_request(socket_path, output_filename) : String?
+      return nil unless File.exists?(socket_path)
+      conn = UNIXSocket.new(socket_path)
+      begin
+        conn << "BUILD\t#{File.expand_path(output_filename)}\n"
+        conn.flush
+        conn.gets
+      ensure
+        conn.close
+      end
+    rescue
+      nil
+    end
+
+    # Spawn a detached daemon to warm this build's program for the next request.
+    # Best-effort: a failure just means the next build is another cold one.
+    private def spawn_daemon(socket_path) : Nil
+      argv = (watch_argv || ARGV).reject { |a| a == "--daemon" }
+      argv << "--daemon-serve" << socket_path
+      exe = Process.executable_path || PROGRAM_NAME
+      log = File.open("#{socket_path}.log", "w")
+      Process.new(exe, argv, input: Process::Redirect::Close, output: log, error: log)
+    rescue ex
+      stderr.puts "[daemon] could not spawn: #{ex.message}"
+    end
+
+    # Phase-2 (M3) in-process re-green experiment. Computes the codegen
+    # fingerprint, re-infers a subset of instantiations, recomputes the
+    # fingerprint, and asserts byte-identity (M3a idempotence: re-inferring a
+    # subset against the fixed green boundary must reproduce the whole-program
+    # result). Prints a diagnostic report and exits.
+    private def run_m3_experiment(program, engine, node)
+      program.codegen_incremental = true
+      filter = ENV["CRYSTAL_M3_FILTER"]? || ""
+
+      # `compute`/`type_structure` lazily MATERIALIZES generic-module metaclass
+      # types as a side effect of rendering ancestors, so two back-to-back calls
+      # differ until that settles. Stabilize to a fixpoint so the measurement
+      # reflects re-inference only, not the walk's own lazy type creation.
+      warm = m3_stabilize(program)
+      m0, s0, y0 = IncrementalCodegen.epoch_parts(program)
+      fp0 = IncrementalCodegen.compute(program)
+      entries0 = IncrementalCodegen.module_entries(program)
+
+      n, errors, unsound = engine.reinfer(program, filter, node)
+
+      m3_stabilize(program)
+      m1, s1, y1 = IncrementalCodegen.epoch_parts(program)
+      fp1 = IncrementalCodegen.compute(program)
+      entries1 = IncrementalCodegen.module_entries(program)
+
+      stderr.puts "[m3a] reinferred #{n} instance(s) (filter=#{filter.inspect}), recalc errors=#{errors}, unexpanded(unsound)=#{unsound}, warmup_iters=#{warm}"
+      stderr.puts "[m3a] epoch parts: mangled=#{m0 == m1 ? "==" : "DIFF"} structures=#{s0 == s1 ? "==" : "DIFF"} symbols=#{y0 == y1 ? "==" : "DIFF"}"
+      m3_report_list_diff("mangled", m0, m1)
+      m3_report_list_diff("structures", s0, s1)
+      m3_report_list_diff("symbols", y0, y1)
+
+      all_keys = (fp0.modules.keys + fp1.modules.keys).uniq!
+      changed = all_keys.select { |k| fp0.modules[k]? != fp1.modules[k]? }.sort!
+      stderr.puts "[m3a] modules: #{fp1.modules.size} total, #{changed.size} differ"
+      changed.first(30).each do |k|
+        tag = fp0.modules[k]? ? (fp1.modules[k]? ? "changed" : "removed") : "added"
+        stderr.puts "   DIFF[#{tag}]: #{k.empty? ? "<main>" : k}"
+      end
+      # Entry-level diff of the first divergent module: which instances were
+      # added/removed (vs changed-in-place), to pinpoint the mechanism.
+      changed.first(2).each do |k|
+        b = (entries0[k]? || [] of String).to_set
+        a = (entries1[k]? || [] of String).to_set
+        added = (a - b).to_a.sort!
+        removed = (b - a).to_a.sort!
+        stderr.puts "   --- module #{k.empty? ? "<main>" : k}: +#{added.size} -#{removed.size} entries ---"
+        added.first(4).each { |e| stderr.puts "      +#{e.lines.first?}" }
+        removed.first(4).each { |e| stderr.puts "      -#{e.lines.first?}" }
+      end
+      # Classify each changed module: is the divergence COSMETIC — identical
+      # after normalizing the `__temp_<n>` locals that re-inference renumbers
+      # (these are SSA-ish names that never reach the `.o`) — or REAL (different
+      # instance set / body shape)? Cosmetic-only divergence is a measurement
+      # artifact of `compute` hashing the raw `typed_def.to_s`; the emitted code
+      # is byte-identical.
+      cosmetic = changed.count do |k|
+        m3_normalize(entries0[k]? || [] of String) == m3_normalize(entries1[k]? || [] of String)
+      end
+      stderr.puts "[m3a] of #{changed.size} changed module(s): #{cosmetic} cosmetic (temp-renumber only), #{changed.size - cosmetic} real" unless changed.empty?
+
+      # Reachability of the added/changed instances after re-green: run the
+      # from-root collector (the codegen reachability oracle) on the re-greened
+      # program and report whether each ADDED mangled name is reachable. Same
+      # collector used cold-side (CRYSTAL_M3_REACH), so its incompleteness
+      # cancels in the cold-vs-warm comparison. Reachable adds => cold/warm
+      # reachability genuinely differs (order-dependence fix); unreachable adds
+      # => a post-re-green sweep can evict them.
+      reach = m3_reach(program, node)
+      added_names = (m1.to_set - m0.to_set).to_a.sort!
+      unless added_names.empty?
+        n_reachable = added_names.count { |x| reach.includes?(x) }
+        stderr.puts "[m3a] reachability of #{added_names.size} added instance(s): #{n_reachable} reachable, #{added_names.size - n_reachable} unreachable (from-root collector, |reach|=#{reach.size})"
+        added_names.first(12).each do |x|
+          stderr.puts "      #{reach.includes?(x) ? "REACH " : "unreach"} #{x}"
+        end
+      end
+      # Junk measurement: how many of the PRE-re-green instances (== a cold
+      # build's def_instances) are themselves unreachable from root? If this is
+      # ~0, cold's def_instances == its reachable set and a global reachability
+      # sweep is exactly right; if large, cold retains unreachable junk and a
+      # global sweep would over-evict.
+      junk = (m0.to_set - reach).size
+      stderr.puts "[m3a] cold junk: #{m0.size} pre-re-green instances, #{junk} unreachable from root (#{(100.0 * junk / m0.size).round(1)}%)"
+      if reach_path = ENV["CRYSTAL_M3_REACH"]?
+        File.write(reach_path, reach.to_a.sort!.join('\n'))
+      end
+
+      ok = fp0.epoch == fp1.epoch && changed.empty? && errors == 0 && unsound == 0
+      stderr.puts "[m3a] RESULT: #{ok ? "IDEMPOTENT" : "DIVERGED"}#{unsound > 0 ? " (UNSOUND: #{unsound} unexpanded node(s) -> would fail closed)" : ""}"
+      # CRYSTAL_M3_NOEXIT: proceed to codegen instead of exiting, so the caller
+      # can compare the actual emitted binary (re-green vs a no-op-filter cold
+      # build, both in this cleanup:false mode) — testing whether the
+      # over-instantiation is pruned by codegen and thus correctness-neutral.
+      return if ENV["CRYSTAL_M3_NOEXIT"]?
+      exit(ok ? 0 : 1)
+    end
+
+    # Run the from-root reachability Collector (codegen's reachability oracle,
+    # `incremental_collect.cr`) on the typed program and return the set of
+    # reachable mangled instance names. Used by the M3 experiments to decide
+    # whether over-instantiated virtual instances are genuinely reachable.
+    private def m3_reach(program, node) : Set(String)
+      Crystal::IncrementalCodegen::Collector.new(program).collect(node)
+    end
+
+    # Normalize a module's entry list for cosmetic-vs-real divergence comparison:
+    # collapse the auto-generated `__temp_<n>` local counters that re-inference
+    # renumbers. Two entry lists that match after this differ only in names that
+    # never reach the emitted object.
+    private def m3_normalize(entries : Array(String)) : Array(String)
+      entries.map(&.gsub(/__temp_\d+/, "__temp_N")).sort!
+    end
+
+    # M3b re-green: splice an edited source's changed method bodies into the
+    # just-inferred program, re-infer only those defs' instances, and dump the
+    # resulting fingerprint. A shell harness compares it to a cold build of the
+    # edited source (CRYSTAL_M3_FP). Rung 1 handles body-only (signature-stable)
+    # edits; a changed signature (different DefId) is reported and skipped.
+    private def run_m3b_experiment(program, engine, new_path, main_file, main_node)
+      program.codegen_incremental = true
+      edited_file = ENV["CRYSTAL_M3B_FILE"]? || main_file
+      seeds = m3_compute_seeds(program, engine, new_path, edited_file)
+      unless seeds
+        stderr.puts "[m3b] verdict=FAIL_CLOSED reason=non-body-edit (structure/initializer/top-level changed)"
+        exit 0 unless ENV["CRYSTAL_M3_NOEXIT"]?
+        # Under NOEXIT the caller proceeds to codegen the (un-re-greened) old
+        # program; a real wire-up would instead re-infer the new source from
+        # scratch. The classifier treats this verdict as the (safe) fail-closed
+        # outcome, not a byte-identity claim.
+        return
+      end
+
+      stderr.puts "[m3b] verdict=SPLICEABLE spliced #{seeds.size} edited def(s)"
+      m3_stabilize(program)
+      n, errors, unsound = engine.reinfer_defs(program, seeds, main_node)
+      m3_stabilize(program)
+      out_path = ENV["CRYSTAL_M3B_OUT"]? || "/tmp/m3b_warm.fp"
+      m3_dump_fp(IncrementalCodegen.compute(program), out_path)
+      stderr.puts "[m3b] reinferred #{n} instance(s), recalc errors=#{errors}, unexpanded(unsound)=#{unsound}, dumped #{out_path}"
+      # NOEXIT: proceed to cleanup + codegen (caller) so the spliced/re-greened
+      # binary can be compared to a cold build of the edited source.
+      return if ENV["CRYSTAL_M3_NOEXIT"]?
+      exit 0
+    end
+
+    # Gate + splice for ONE edit. Returns the set of spliced seed def object_ids,
+    # or `nil` if the edit is not body-only (the caller must FAIL CLOSED). On a
+    # non-nil result the matched templates' bodies have already been replaced with
+    # the edited (normalized) bodies, ready for `reinfer_defs`.
+    private def m3_compute_seeds(program, engine, new_path, edited_file) : Set(UInt64)?
+      # Test-harness entry: the edited content lives in a separate file, the
+      # original is still pristine on disk. A real watch (`watch_seeds`) instead
+      # passes the in-memory pre-edit snapshot, since the file is edited in place.
+      m3_seeds_from_src(program, engine, File.read(edited_file), File.read(new_path), edited_file)
+    end
+
+    # Gate + splice core shared by the test harness and the watch loop. Returns
+    # the set of template object-ids to re-green (empty = no body changed), or
+    # nil if the edit is outside the body-only splice envelope (caller fails
+    # closed). *old_src*/*new_src* are the file's content before/after the edit;
+    # *edited_file* is its path (spliced nodes are parsed under it so locations
+    # match an in-place edit and the warm binary stays byte-identical to cold).
+    private def m3_seeds_from_src(program, engine, old_src : String, new_src : String, edited_file : String) : Set(UInt64)?
+      new_parser = Crystal::Parser.new(new_src)
+      new_parser.filename = edited_file
+      new_raw = new_parser.parse
+      old_raw = Crystal::Parser.new(old_src).parse
+
+      # SOUND EDIT GATE: re-green can only apply a pure method-body change. Any
+      # other change (a def's signature, the set/order of defs, a constant or
+      # class-var initializer, top-level code) is outside the splice envelope, and
+      # `__END_LINE__` (baked at parse from the enclosing end, which a body edit can
+      # move without moving the token) is too subtle to track — any presence fails
+      # closed. (`__LINE__` is handled below: its baked `NumberLiteral` value moves
+      # with its def, so ordinal matching re-splices it.)
+      return nil if ReGreenEngine.has_end_line_token?(old_src) || ReGreenEngine.has_end_line_token?(new_src)
+      return nil unless ReGreenEngine.body_only_edit?(old_raw, new_raw)
+
+      # Normalize the edited source the same way the cold path does
+      # (`SemanticVisitor` normalizes every file before inference) so the extracted
+      # bodies match the in-place-normalized templates and a spliced body never
+      # carries un-normalized sugar (e.g. `OpAssign`) into re-inference.
+      # Snapshot the RAW (un-normalized) body STRINGS by ordinal BEFORE
+      # normalizing: `normalize` mutates `new_raw`'s Def nodes in place, and
+      # `collect_defs` returns references to those same nodes, so reading their
+      # `body.to_s` after normalize would see normalized bodies and make the raw
+      # edit-diff below compare raw-vs-normalized (every sugared def reads as
+      # changed). Capturing the strings now freezes the pre-normalize source.
+      old_defs = collect_defs(old_raw) # RAW old defs (== the templates' source)
+      old_raw_bodies = old_defs.map(&.body.to_s)
+      new_raw_bodies = collect_defs(new_raw).map(&.body.to_s)
+
+      new_ast = program.normalize(new_raw)
+      # Match templates to edited defs by ORDINAL (source-order index), NOT by
+      # `line:col:name`: a body edit that changes line count shifts every later
+      # def's line, so a location key mis-matches those defs and silently drops
+      # their edits (and a `__LINE__` whose def moved). The body-only gate
+      # guarantees old and new hold the same defs in the same order, so the i-th
+      # corresponds. `old_raw` shares the templates' (old) source, so map a template
+      # to its index by its own location, then index into the new defs.
+      new_defs = collect_defs(new_ast) # NORMALIZED new defs — the spliced body source
+      loc_to_index = {} of String => Int32
+      old_defs.each_with_index do |d, i|
+        if key = ReGreenEngine.loc_key(d)
+          loc_to_index[key] ||= i
+        end
+      end
+
+      seeds = Set(UInt64).new
+      seed_names = Set(String).new
+      udl = engine.untyped_defs_by_location(edited_file)
+      n_matched = 0
+      n_bodydiff = 0
+      udl.each do |key, template|
+        index = loc_to_index[key]?
+        next unless index
+        n_matched += 1
+        old_body = old_raw_bodies[index]?
+        new_body = new_raw_bodies[index]?
+        new_def = new_defs[index]?
+        next unless old_body && new_body && new_def
+        # Detect the edit by diffing the RAW (un-normalized, un-inferred) source
+        # bodies at this ordinal: `old_body` is the templates' own source and
+        # `new_body` the edited source. Comparing the TEMPLATE body instead is
+        # wrong — inference mutates templates in place (macro expansion, type
+        # annotations) and normalization renumbers `__temp_<n>` locals, so a
+        # source-identical def reads as changed and gets spuriously seeded; re-
+        # greening those extra seeds re-runs their (often virtual-dispatch) calls
+        # and perturbs unrelated modules, breaking byte identity at scale. The raw
+        # source diff seeds exactly the edited defs.
+        next if old_body == new_body
+        n_bodydiff += 1
+        template.body = new_def.body
+        seeds << template.object_id
+        seed_names << template.name
+      end
+      if ENV["CRYSTAL_M3_SEED_DEBUG"]?
+        stderr.puts "[seeddbg] edited_file=#{edited_file.inspect} udl=#{udl.size} old_defs=#{old_defs.size} matched=#{n_matched} seeded(bodydiff)=#{n_bodydiff} instances=#{engine.instances.size}"
+      end
+
+      # FAIL CLOSED if an edited method is named by an argument default value: that
+      # value is cloned into an expansion def the rebind scan can't reach, so the
+      # default-arg site would keep the stale binding (silent staleness).
+      return nil if ReGreenEngine.seed_in_default_arg?(program, seed_names)
+      seeds
+    end
+
+    private def collect_defs(ast) : Array(Crystal::Def)
+      collector = ReGreenEngine::DefCollector.new
+      ast.accept collector
+      collector.defs
+    end
+
+    # Resident-loop feasibility probe (M5 transport). The base program was
+    # inferred once (uncleaned); now apply a SEQUENCE of edits to the SAME
+    # resident program. Each cycle: gate+splice+reinfer (timed) on the live
+    # program, then cleanup + `--incremental` codegen to its own output. The
+    # question this answers: does cleanup + codegen mutating the shared program in
+    # one cycle poison the next re-green? A shell harness compares each output to
+    # a cold build of that edit. Env: CRYSTAL_M3_RESIDENT=1, CRYSTAL_M3B_NEW
+    # (edit 1), CRYSTAL_M3B_NEW2 (edit 2), CRYSTAL_M3B_FILE (main path),
+    # CRYSTAL_M3_RES_OUT (output prefix).
+    private def run_m3_resident(program, engine, node, sources)
+      program.codegen_incremental = true
+      self.incremental_resident = true
+      edited_file = ENV["CRYSTAL_M3B_FILE"]? || sources.first.filename
+      out_prefix = ENV["CRYSTAL_M3_RES_OUT"]? || "/tmp/m3res"
+      # FINAL_ONLY mode: re-green every edit but only cleanup+codegen after the
+      # last one — isolates "is repeated RE-GREEN sound?" from the separate fact
+      # that in-process --incremental codegen is one-shot (the per-cycle codegen
+      # path crashes on the 2nd build; the resident design instead forks per edit).
+      final_only = ENV["CRYSTAL_M3_RES_FINAL_ONLY"]?
+      edits = [ENV["CRYSTAL_M3B_NEW"]?, ENV["CRYSTAL_M3B_NEW2"]?,
+               ENV["CRYSTAL_M3B_NEW3"]?, ENV["CRYSTAL_M3B_NEW4"]?].compact
+      # Externals already dead before the first codegen (duplicate fun
+      # declarations) must stay dead across all cycles; only the live funs codegen
+      # flips to "already emitted" get reset. Captured from the first cycle's
+      # CLEANED tree (the tree codegen walks), since the pre-cleanup `node` does
+      # not expose the prelude funs.
+      semantic_dead = nil
+      edits.each_with_index do |ef, i|
+        cyc0 = Time.instant
+        seeds = m3_compute_seeds(program, engine, ef, edited_file)
+        unless seeds
+          stderr.puts "[m3res] edit #{i}: FAIL_CLOSED (non-body)"
+          next
+        end
+        gate = (Time.instant - cyc0).total_milliseconds
+        t0 = Time.instant
+        n, errors, unsound = engine.reinfer_defs(program, seeds, node)
+        sem = (Time.instant - t0).total_milliseconds
+        stderr.puts "[m3res] edit #{i}: spliced=#{seeds.size} reinfer=#{n} err=#{errors} uns=#{unsound} regreen=#{sem.round(2)}ms"
+        if errors > 0 || unsound > 0
+          stderr.puts "[m3res] edit #{i}: FAIL_CLOSED (gate)"
+          next
+        end
+        next if final_only && i < edits.size - 1
+        cl0 = Time.instant
+        cleaned = program.cleanup(node)
+        # The memoized cleanup transformer skips any def whose callers were
+        # cleaned on an earlier cycle, so the walk above never reaches the bodies
+        # re-green just created. Clean them explicitly (the `@transformed` guard
+        # makes already-clean ones a no-op).
+        engine.last_regreen_instances.each do |inst|
+          program.cleanup_transformer.cleanup_def(inst.typed_def)
+        end
+        program.cleanup_types
+        program.cleanup_files
+        # In-process re-codegen: clear the per-build state codegen mutates on
+        # shared AST/type objects (fun "already emitted" flags, baked const
+        # initializers) so this cycle emits as if from a fresh process. The
+        # incremental `.o`/state reuse is already cross-cycle by construction
+        # (cycle N loads cycle N-1's on-disk state for the same source path).
+        # The first codegen needs no reset (nothing emitted yet); it just records
+        # the pre-codegen dead baseline.
+        if base = semantic_dead
+          ReGreenEngine.reset_codegen_emission_state(program, cleaned, base)
+        else
+          semantic_dead = ReGreenEngine.collect_dead_externals(cleaned)
+        end
+        # Settle `compute`'s lazy type materialization to a fixpoint so the epoch
+        # is stable across in-process cycles. `compute`/`type_structure` lazily
+        # materializes generic-module metaclass types as a render side effect, so
+        # the epoch a cycle SAVES differs from the next cycle's freshly-computed
+        # one until it settles; without this, `reusable` bails on the epoch
+        # mismatch (`incremental.cr` `prev.epoch == cur.epoch`) and NO module is
+        # skipped. Resident-only — a normal build computes once and never compares
+        # across cycles, and stabilizing there would needlessly re-walk all types.
+        m3_stabilize(program) unless ENV["CRYSTAL_M3_NOSTAB"]?
+        # Snapshot the materialized type set around codegen so the engine learns
+        # which types this codegen lazily materialized (metaclasses via the
+        # `metaclass` getter, unions into `program.unions`). A fresh build mints
+        # those only after its own pin/epoch snapshot, so the next cycle must
+        # exclude them to match it — see `ReGreenEngine#codegen_created_types`.
+        cl = (Time.instant - cl0).total_milliseconds
+        engine.fp_dirty_modules = engine.fp_dirty_modules_for(seeds)
+        before_types = ReGreenEngine.materialized_type_ids(program)
+        cg0 = Time.instant
+        codegen program, cleaned, sources, "#{out_prefix}.#{i}"
+        cg = (Time.instant - cg0).total_milliseconds
+        engine.note_codegen_types(before_types, ReGreenEngine.materialized_type_ids(program))
+        full = (Time.instant - cyc0).total_milliseconds
+        stderr.puts "[m3res] edit #{i}: codegen -> #{out_prefix}.#{i} (#{cg.round(1)}ms, re-green+codegen=#{(sem + cg).round(1)}ms, gate=#{gate.round(1)}ms cleanup+stab=#{cl.round(1)}ms full_cycle=#{full.round(1)}ms) [load=#{@inc_t_load.round(1)}ms compute=#{@inc_t_compute.round(1)}ms save=#{@inc_t_save.round(1)}ms]"
+      end
+      exit 0
+    end
+
+    # Write a fingerprint as a deterministic, diffable text file: the epoch on
+    # the first line, then sorted "module<TAB>hash" lines.
+    private def m3_dump_fp(fp, path)
+      File.open(path, "w") do |f|
+        f.puts fp.epoch
+        fp.modules.keys.sort!.each { |k| f.puts "#{k}\t#{fp.modules[k]}" }
+      end
+    end
+
+    # Drive the lazy generic-metaclass materialization to a fixpoint: run
+    # `materialize_pass` (the same `type_structure` walk `compute` performs, minus
+    # the per-instance mangled-name render and sort) until the materialized
+    # type-id set stops growing. Returns iterations (-1 if it never settled).
+    # Capped against a loop.
+    private def m3_stabilize(program) : Int32
+      prev = IncrementalCodegen.materialize_pass(program)
+      (1..6).each do |i|
+        cur = IncrementalCodegen.materialize_pass(program)
+        return i if cur == prev
+        prev = cur
+      end
+      -1
+    end
+
+    # Report the set difference between two epoch-component lists (added/removed
+    # entries), capped, so a divergence names the exact strings involved.
+    private def m3_report_list_diff(label, before : Array(String), after : Array(String))
+      return if before == after
+      b = before.to_set
+      a = after.to_set
+      added = (a - b).to_a.sort!
+      removed = (b - a).to_a.sort!
+      stderr.puts "   [#{label}] +#{added.size} -#{removed.size}"
+      added.first(15).each { |x| stderr.puts "      + #{x}" }
+      removed.first(15).each { |x| stderr.puts "      - #{x}" }
     end
 
     # Runs the semantic pass on the given source, without generating an
@@ -347,7 +1235,11 @@ module Crystal
 
     private def bc_flags_changed?(output_dir)
       bc_flags_changed = true
-      current_bc_flags = "#{@codegen_target}|#{@mcpu}|#{@mattr}|#{@link_flags}|#{@mcmodel}"
+      # `debug` and `frame_pointers` change the emitted `.o` but not a module's
+      # incremental fingerprint, so without them here a skipped (reused) module
+      # could carry a `.o` built under different settings. Folding them in forces
+      # a full rebuild when they change, which is correct (never stale).
+      current_bc_flags = "#{@codegen_target}|#{@mcpu}|#{@mattr}|#{@link_flags}|#{@mcmodel}|#{debug}|#{frame_pointers}"
       bc_flags_filename = "#{output_dir}/bc_flags#{optimization_mode.suffix}"
       if File.file?(bc_flags_filename)
         previous_bc_flags = File.read(bc_flags_filename).strip
@@ -365,20 +1257,86 @@ module Crystal
         end
       {% end %}
 
-      llvm_modules = @progress_tracker.stage("Codegen (crystal)") do
-        program.codegen node, debug: debug, frame_pointers: frame_pointers,
-          single_module: @single_module || @cross_compile || !@emit_targets.none?
+      single_module = @single_module || @cross_compile || !@emit_targets.none?
+      output_dir = CacheDir.instance.directory_for(sources)
+      bc_flags_changed = bc_flags_changed? output_dir
+
+      # Incremental codegen: fingerprint the typed program before generating IR,
+      # then run the pre-flight that shrinks the skip set so the link cannot fail
+      # (Layer 1). Codegen runs exactly once — no re-run fallback.
+      prev_state = nil
+      fingerprints = nil
+      skip_modules = Set(String).new
+      if incremental? && !single_module
+        # Make `Def#mangled_name` fold in the structural DefId for every name it
+        # builds this build (fingerprint, instantiation index, seed, codegen),
+        # consistently. Must be set before the first `mangled_name` call below.
+        program.codegen_incremental = true
+        t = Time.instant
+        # Resident: reuse the previous cycle's State from memory (skips the
+        # multi-MB JSON read); fall back to disk on the first cycle / cold build.
+        prev_state = (incremental_resident? ? @resident_state : nil) ||
+                     IncrementalCodegen::State.load(incremental_state_path(output_dir))
+        @inc_t_load = (Time.instant - t).total_milliseconds
+        t = Time.instant
+        fingerprints = IncrementalCodegen.compute(program)
+        @inc_t_compute = (Time.instant - t).total_milliseconds
+        unless bc_flags_changed
+          # Pin ids now so the determinism assert sees the same integers a warm
+          # build will bake; id drift forces a full rebuild (never a bad binary).
+          current_type_ids = IncrementalCodegen.pin_type_ids(program)
+          if IncrementalCodegen.type_ids_stable?(prev_state, current_type_ids)
+            candidate = IncrementalCodegen.reusable(prev_state, fingerprints, output_dir)
+            index = IncrementalCodegen.instantiation_index(program)
+            proc_ok = Set(String).new # proc-thunk replay is Phase C; none yet
+            skip_modules = IncrementalCodegen.satisfy(prev_state, candidate, index, proc_ok)
+            if ENV["CRYSTAL_INC_DEBUG"]?
+              stderr.puts "[inc] modules=#{fingerprints.modules.size} reusable=#{candidate.size} skipped=#{skip_modules.size} evicted=#{candidate.size - skip_modules.size}"
+            end
+          elsif ENV["CRYSTAL_INC_DEBUG"]?
+            stderr.puts "[inc] type_id drift -> full rebuild"
+          end
+        end
       end
 
-      output_dir = CacheDir.instance.directory_for(sources)
+      units = codegen_attempt(program, node, output_filename, output_dir, single_module,
+        bc_flags_changed, fingerprints, prev_state, skip_modules)
 
-      bc_flags_changed = bc_flags_changed? output_dir
+      CacheDir.instance.cleanup if @cleanup
+
+      units
+    end
+
+    private def codegen_attempt(program, node, output_filename, output_dir, single_module,
+                                bc_flags_changed, fingerprints, prev_state, skip_modules)
+      llvm_modules = @progress_tracker.stage("Codegen (crystal)") do
+        program.codegen node, debug: debug, frame_pointers: frame_pointers,
+          single_module: single_module, skip_modules: skip_modules,
+          prev_state: prev_state, track_generated_funs: fingerprints != nil
+      end
+
       target_triple = target_machine.triple
 
-      units = llvm_modules.map do |type_name, info|
+      objects = {} of String => String
+      reused_object_names = [] of String
+      units = [] of CompilationUnit
+      llvm_modules.each do |type_name, info|
+        next if skip_modules.includes?(type_name)
         llvm_mod = info.mod
         llvm_mod.target = target_triple
-        CompilationUnit.new(self, program, type_name, llvm_mod, output_dir, bc_flags_changed)
+        unit = CompilationUnit.new(self, program, type_name, llvm_mod, output_dir, bc_flags_changed)
+        units << unit
+        objects[type_name] = unit.object_filename
+      end
+
+      # Carry forward cached objects for skipped modules and link them directly.
+      if prev_state
+        skip_modules.each do |mod|
+          if obj = prev_state.objects[mod]?
+            objects[mod] = obj
+            reused_object_names << obj
+          end
+        end
       end
 
       {% if LibLLVM::IS_LT_170 %}
@@ -391,7 +1349,56 @@ module Crystal
         cross_compile program, units, output_filename
       else
         units = with_file_lock(output_dir) do
-          codegen program, units, output_filename, output_dir
+          codegen program, units, output_filename, output_dir, reused_object_names
+        end
+
+        # Persist state only after a successful build, so the next incremental
+        # run never reuses an object file this build failed to produce.
+        if fingerprints
+          live = {} of String => Array(String)
+          program.codegen_live_funs.try &.each { |mod, names| live[mod] = names.to_a }
+
+          # Cross-module inline edges from this build's regenerated modules; a
+          # skipped module keeps the cached `.o`'s edges (carried forward below).
+          inline_deps = {} of String => Array(String)
+          program.codegen_inline_deps.try &.each { |mod, callees| inline_deps[mod] = callees.to_a }
+
+          # Layer 1: derive each regenerated `.o`'s exports/imports from the
+          # emitted IR (ground truth); carry forward reused modules' tables.
+          exports = {} of String => Array(String)
+          imports = {} of String => Array(String)
+          llvm_modules.each do |type_name, info|
+            next if skip_modules.includes?(type_name)
+            exports[type_name], imports[type_name] = IncrementalCodegen.module_symbols(info.mod)
+          end
+          if prev_state
+            skip_modules.each do |mod|
+              live[mod] = prev_state.live[mod]? || [] of String
+              exports[mod] = prev_state.exports[mod]? || [] of String
+              imports[mod] = prev_state.imports[mod]? || [] of String
+              if d = prev_state.inline_deps[mod]?
+                inline_deps[mod] = d
+              end
+            end
+          end
+
+          state = IncrementalCodegen::State.new(
+            fingerprints.epoch, fingerprints.modules, objects, live, exports, imports,
+            program.codegen_eager_main || [] of String,
+            program.codegen_main_symbols || [] of IncrementalCodegen::MainSymbolRecord,
+            program.codegen_type_id_table || {} of String => Int32,
+            inline_deps,
+          )
+          t = Time.instant
+          # Resident: carry the State in memory for the next cycle's `prev_state`
+          # instead of writing it (the `.o` files are still on disk; the JSON is
+          # flushed before a fallback subprocess rebuild). Cold builds save now.
+          if incremental_resident?
+            @resident_state = state
+          else
+            state.save(incremental_state_path(output_dir))
+          end
+          @inc_t_save = (Time.instant - t).total_milliseconds
         end
 
         {% if flag?(:darwin) %}
@@ -403,9 +1410,11 @@ module Crystal
         {% end %}
       end
 
-      CacheDir.instance.cleanup if @cleanup
-
       units
+    end
+
+    private def incremental_state_path(output_dir)
+      File.join(output_dir, "incremental#{optimization_mode.suffix}.json")
     end
 
     private def with_file_lock(output_dir, &)
@@ -598,22 +1607,31 @@ module Crystal
       end
     end
 
-    private def codegen(program, units : Array(CompilationUnit), output_filename, output_dir)
-      object_names = units.map &.object_filename
+    private def codegen(program, units : Array(CompilationUnit), output_filename, output_dir, reused_object_names = [] of String)
+      object_names = units.map(&.object_filename) + reused_object_names
+      # Incremental builds split objects into regenerated `units` and reused
+      # `reused_object_names`, so their concatenation order differs from a cold
+      # build's (and across warm builds). Object order is semantically irrelevant
+      # (symbols are unique; startup order is driven by `__crystal_main`, not link
+      # order) but determines the final binary's layout, so sort for a deterministic,
+      # byte-identical incremental==cold executable.
+      object_names.sort! if incremental?
 
-      @progress_tracker.stage("Codegen (bc+obj)") do
-        @progress_tracker.stage_progress_total = units.size
+      unless units.empty?
+        @progress_tracker.stage("Codegen (bc+obj)") do
+          @progress_tracker.stage_progress_total = units.size
 
-        n_threads = @n_threads.clamp(1..units.size)
+          n_threads = @n_threads.clamp(1..units.size)
 
-        if n_threads == 1
-          sequential_codegen(units)
-        else
-          parallel_codegen(units, n_threads)
-        end
+          if n_threads == 1
+            sequential_codegen(units)
+          else
+            parallel_codegen(units, n_threads)
+          end
 
-        if units.size == 1
-          units.first.emit(@emit_targets, emit_base_filename || output_filename)
+          if units.size == 1
+            units.first.emit(@emit_targets, emit_base_filename || output_filename)
+          end
         end
       end
 
@@ -656,14 +1674,32 @@ module Crystal
       wg = WaitGroup.new
       mutex = Sync::Mutex.new
 
-      n_threads.times do
-        wg.spawn do
-          while unit = channel.receive?
-            unit.compile(isolate_context: true)
-            mutex.synchronize { @progress_tracker.stage_progress += 1 }
+      {% if flag?(:execution_context) %}
+        # Run the workers in a dedicated execution context rather than spawning
+        # them into the default one alongside the producing main fiber. With the
+        # experimental `execution_context` scheduler a same-context enqueue only
+        # does a local push and never calls `wake_scheduler`, so a fiber woken
+        # while every scheduler has parked can be stranded (the default context's
+        # monitor stops waking schedulers once none are active). The heavy channel
+        # churn of many small modules makes that window reachable and the build
+        # deadlocks. Sending across context boundaries instead routes through
+        # `external_enqueue` -> `wake_scheduler`, which interrupts the event loop
+        # and wakes parked schedulers, so the producer/worker handoff always
+        # makes progress.
+        context = Fiber::ExecutionContext::Parallel.new("codegen", n_threads)
+        n_threads.times do
+          wg.add
+          context.spawn do
+            codegen_worker(channel, mutex)
+          ensure
+            wg.done
           end
         end
-      end
+      {% else %}
+        n_threads.times do
+          wg.spawn { codegen_worker(channel, mutex) }
+        end
+      {% end %}
 
       units.each do |unit|
         # We generate the bitcode in the main thread because LLVM contexts
@@ -682,6 +1718,13 @@ module Crystal
       channel.close
 
       wg.wait
+    end
+
+    private def codegen_worker(channel : Channel(CompilationUnit), mutex : Sync::Mutex) : Nil
+      while unit = channel.receive?
+        unit.compile(isolate_context: true)
+        mutex.synchronize { @progress_tracker.stage_progress += 1 }
+      end
     end
 
     private def fork_codegen(units, n_threads)
@@ -919,6 +1962,10 @@ module Crystal
         Process.run(command, args, shell: true,
           input: Process::Redirect::Close, output: Process::Redirect::Inherit, error: Process::Redirect::Pipe) do |process|
           process.error.each_line(chomp: false) do |line|
+            # Linker output is not guaranteed valid UTF-8 (incremental `.o` names
+            # embed raw digest bytes), and `gsub` with a Regex raises on invalid
+            # bytes; scrub them first so a benign linker note can't abort the build.
+            line = line.scrub
             hint_string = colorize("(this usually means you need to install the development package for lib\\1)").yellow.bold
             line = line.gsub(/cannot find -l(\S+)\b/, "cannot find -l\\1 #{hint_string}")
             line = line.gsub(/unable to find library -l(\S+)\b/, "unable to find library -l\\1 #{hint_string}")
@@ -997,11 +2044,23 @@ module Crystal
         end
 
         @name = "#{@name}#{@compiler.optimization_mode.suffix}"
+        # Incremental builds pin type ids and force the read-fn const path, so
+        # their `.o`/`.bc` differ from a plain build's. Namespace them so a plain
+        # `crystal build` into the same cache can't silently overwrite (poison)
+        # the `.o` a later `--incremental` build reuses.
+        @name = "#{@name}-inc" if @compiler.incremental?
         @object_extension = compiler.codegen_target.object_extension
       end
 
       def generate_bitcode
-        @memory_buffer ||= llvm_mod.write_bitcode_to_memory_buffer
+        @memory_buffer ||= begin
+          # Incremental codegen emits a module's functions in walk order plus
+          # seed/force-appended ones, so the function layout (and thus `.text`/
+          # `.eh_frame`) drifts vs a cold build. Sorting by name makes the object
+          # file deterministic, a prerequisite for byte-identical incremental==cold.
+          llvm_mod.sort_functions! if @compiler.incremental?
+          llvm_mod.write_bitcode_to_memory_buffer
+        end
       end
 
       # To compile a file we first generate a `.bc` file and then create an

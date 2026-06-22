@@ -45,6 +45,14 @@ class Crystal::CodeGenVisitor
   end
 
   def declare_fun(mangled_name, func : LLVMTypedFunction) : LLVMTypedFunction
+    if (w = ENV["CRYSTAL_INC_WATCH"]?) && mangled_name.includes?(w)
+      caller = begin
+        context.fun.name
+      rescue
+        "?"
+      end
+      STDERR.puts "[inc-watch] DECLARE #{mangled_name} into mod=#{@llvm_mod.name} caller=#{caller} phase=#{inc_phase}"
+    end
     type = @llvm_typer.copy_type(func.type)
     typed_fun = add_typed_fun(@llvm_mod, mangled_name, type)
 
@@ -95,6 +103,18 @@ class Crystal::CodeGenVisitor
       args = codegen_fun_signature(mangled_name, target_def, self_type, is_fun_literal, is_closure)
 
       needs_body = !target_def.is_a?(External) || is_exported_fun
+      # Incremental codegen: a reused (unchanged) module's functions are emitted
+      # as declarations only; their definitions come from the cached `.o`.
+      if needs_body && !is_exported_fun && !is_fun_literal && !is_closure && !@skip_modules.empty?
+        mod_name = IncrementalCodegen.module_name(self_type)
+        needs_body = false if !mod_name.empty? && @skip_modules.includes?(mod_name)
+      end
+      if needs_body && track_generated_funs?
+        (@generated_funs[IncrementalCodegen.module_name(self_type)] ||= Set(String).new) << mangled_name
+      end
+      if (w = ENV["CRYSTAL_INC_WATCH"]?) && mangled_name.includes?(w)
+        STDERR.puts "[inc-watch] CODEGEN_FUN #{mangled_name} needs_body=#{needs_body} mod=#{IncrementalCodegen.module_name(self_type)} phase=#{inc_phase} def_loc=#{target_def.location} seed_root=#{inc_seed_root}"
+      end
       if needs_body
         emit_def_debug_metadata target_def unless @debug.none?
         set_current_debug_location target_def if @debug.line_numbers?
@@ -189,6 +209,23 @@ class Crystal::CodeGenVisitor
         codegen_return(target_def)
 
         br_from_alloca_to_entry
+
+        # A NoReturn function whose whole body is a lone `unreachable` (e.g.
+        # `Intrinsics.unreachable`) lowers to zero machine bytes. The backend still
+        # emits unwind info for it, producing a zero-length FDE; the linker then lays
+        # that FDE at the same address as the next function and `.eh_frame_hdr` resolves
+        # that address to the zero-length FDE, shadowing the next function's real FDE
+        # and breaking stack unwinding through it. Emit a trap so the function occupies
+        # a byte and gets its own non-empty FDE. (It is never actually executed.)
+        #
+        # Only under incremental codegen: that's where a module's link order reliably
+        # lands the zero-byte function before an exception-path function and crashes.
+        # Gating here keeps the trap out of non-incremental (esp. release) builds,
+        # where inlining it into `Intrinsics.unreachable` call sites (e.g. the
+        # `__crystal_once` lazy-init guard) would defeat the `unreachable` optimizer hint.
+        if track_generated_funs? && target_def.type?.try(&.no_return?) && fun_body_is_lone_terminator?(context.fun)
+          ensure_non_empty_unreachable_fun(context.fun)
+        end
       end
 
       @last = llvm_nil
@@ -234,6 +271,41 @@ class Crystal::CodeGenVisitor
 
       LLVMTypedFunction.new(context.fun_type, context.fun)
     end
+  end
+
+  # True when `llvm_fun`'s body is a single basic block holding a single
+  # instruction. For a NoReturn def that instruction is the lone `unreachable`,
+  # which the backend lowers to zero machine bytes. Multi-block bodies (e.g. a
+  # `while true` loop) and bodies with real instructions are excluded.
+  def fun_body_is_lone_terminator?(llvm_fun) : Bool
+    blocks = 0
+    insts = 0
+    llvm_fun.basic_blocks.each do |block|
+      blocks += 1
+      return false if blocks > 1
+      block.instructions.each do
+        insts += 1
+        return false if insts > 1
+      end
+    end
+    blocks == 1 && insts == 1
+  end
+
+  # Insert an `llvm.trap` (lowers to a 2-byte `ud2`) before the lone `unreachable`
+  # so the function is non-empty and gets its own non-zero-length FDE. See the call
+  # site for why a zero-byte function corrupts `.eh_frame_hdr`.
+  def ensure_non_empty_unreachable_fun(llvm_fun) : Nil
+    block = llvm_fun.basic_blocks.first?
+    return unless block
+    terminator = nil
+    block.instructions.each { |inst| terminator = inst }
+    return unless terminator
+
+    trap_fun = fetch_typed_fun(@llvm_mod, "llvm.trap") do
+      LLVM::Type.function([] of LLVM::Type, @llvm_context.void)
+    end
+    builder.position_before(terminator)
+    call trap_fun, [] of LLVM::Value
   end
 
   def codegen_return(target_def : Def)

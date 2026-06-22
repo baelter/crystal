@@ -80,6 +80,22 @@ class LLVM::Module
     error = LibLLVM.verify_module(self, LLVM::VerifierFailureAction::ReturnStatusAction, out message)
     begin
       if error == 1
+        if ENV["CRYSTAL_INC_DEBUG"]?
+          modname = String.new(LibLLVM.get_module_identifier(self, out _len)) rescue "?"
+          # Pinpoint the first function that fails verification and dump its IR.
+          bad = nil
+          fn = LibLLVM.get_first_function(self)
+          while fn && bad.nil?
+            if LibLLVM.verify_function(fn, LLVM::VerifierFailureAction::ReturnStatusAction)
+              fname = String.new(LibLLVM.get_value_name(fn))
+              ir = String.new(LibLLVM.print_value_to_string(fn))
+              File.write("/tmp/inc_bad_fn.ll", "; module #{modname}\n; function #{fname}\n#{ir}")
+              bad = fname
+            end
+            fn = LibLLVM.get_next_function(fn)
+          end
+          raise "Module validation failed [#{modname}] bad-fn=#{bad} (dumped /tmp/inc_bad_fn.ll): #{String.new(message)}"
+        end
         raise "Module validation failed: #{String.new(message)}"
       end
     ensure
@@ -108,6 +124,14 @@ class LLVM::Module
   def to_s(io : IO) : Nil
     LLVM.to_io(LibLLVM.print_module_to_string(self), io)
     self
+  end
+
+  # Reorder this module's functions and globals by name. Their order is
+  # semantically irrelevant but determines `.text`/`.eh_frame`/`.rodata` layout in
+  # the object file; sorting makes that layout deterministic across builds.
+  def sort_functions! : Nil
+    LibLLVMExt.sort_module_functions(self)
+    LibLLVMExt.sort_module_globals(self)
   end
 
   def to_unsafe

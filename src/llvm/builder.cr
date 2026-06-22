@@ -8,6 +8,10 @@ class LLVM::Builder
     LibLLVM.position_builder_at_end(self, block)
   end
 
+  def position_before(instruction : LLVM::Value)
+    LibLLVM.position_builder_before(self, instruction)
+  end
+
   def insert_block
     BasicBlock.new LibLLVM.get_insert_block(self)
   end

@@ -153,13 +153,52 @@ module Crystal
     end
 
     def codegen(node, single_module = false, debug = Debug::Default,
-                frame_pointers = FramePointers::Auto)
+                frame_pointers = FramePointers::Auto,
+                skip_modules : Set(String) = Set(String).new,
+                prev_state : IncrementalCodegen::State? = nil,
+                track_generated_funs = false)
+      # Pin all type ids and const access decisions deterministically before any
+      # IR (and before the eager snapshot) so reused `.o` stay consistent across
+      # builds regardless of codegen-walk order.
+      if track_generated_funs
+        @codegen_type_id_table = IncrementalCodegen.pin_type_ids(self)
+        IncrementalCodegen.pin_lazy_init_reads(self)
+      end
+
       visitor = CodeGenVisitor.new self, node, single_module: single_module,
         debug: debug, frame_pointers: frame_pointers
+      visitor.skip_modules = skip_modules
+      visitor.track_generated_funs = track_generated_funs
+      visitor.snapshot_eager_main
       visitor.accept node
+      if prev_state && !skip_modules.empty?
+        # Seeding/forcing emit functions after the walk and leave `@last`
+        # pointing into the last-generated function. `finish` returns `@last` as
+        # the program's value, so save and restore the post-walk `@last` around
+        # them (`process_finished_hooks` already preserves `@last` itself).
+        saved_last = visitor.last
+        visitor.inc_phase = "seed"
+        visitor.codegen_changed_instantiations(prev_state.live)
+        visitor.inc_phase = "force"
+        visitor.force_main_symbols(prev_state) unless ENV["CRYSTAL_INC_NO_FORCE"]?
+        visitor.inc_phase = "walk"
+        visitor.last = saved_last
+      end
       visitor.process_finished_hooks
       visitor.finish
 
+      if track_generated_funs
+        @codegen_live_funs = visitor.generated_funs
+        @codegen_inline_deps = visitor.inline_deps
+        @codegen_main_symbols = visitor.main_symbols
+        @codegen_proc_thunks = visitor.proc_thunks
+        @codegen_eager_main = visitor.eager_main_symbols
+        if ENV["CRYSTAL_INC_COLLECT_CHECK"]?
+          live = Set(String).new
+          visitor.generated_funs.each_value { |s| live.concat(s) }
+          incremental_collect_check(node, live)
+        end
+      end
       visitor.modules
     end
 
@@ -227,6 +266,30 @@ module Crystal
     getter entry_block : LLVM::BasicBlock
     getter personality_name : String
     property last : LLVM::Value
+
+    # Incremental codegen: type-module names whose IR is reused from the cache.
+    # Functions belonging to these modules are emitted as declarations only.
+    property skip_modules : Set(String) = Set(String).new
+
+    # Incremental codegen: when set, record the mangled name of every function
+    # emitted with a body, grouped by type-module (the live/reachable set), plus
+    # the lazily-emitted main-resident helper symbols so a reused module's cached
+    # `.o` never references a symbol the pruned walk forgot to re-emit in main.
+    property? track_generated_funs = false
+    getter generated_funs = Hash(String, Set(String)).new
+    # caller type-module => callee type-modules whose trivial body it inlined
+    # (the cross-module inline dependency; see `Program#codegen_inline_deps`).
+    getter inline_deps = Hash(String, Set(String)).new
+    getter main_symbols = [] of IncrementalCodegen::MainSymbolRecord
+    @main_symbol_names = Set(String).new
+    # proc-thunk replay payloads captured this run (force_main_symbols runs in
+    # the same process, so we never re-resolve a Def across builds).
+    getter proc_thunks = {} of String => {Def, Type, Bool}
+    # main symbols present right after the constructor (always re-emitted).
+    getter eager_main_symbols = [] of String
+    # debug-only: current incremental codegen phase ("walk" | "seed" | "force").
+    property inc_phase = "walk"
+    property inc_seed_root = "?"
 
     class LLVMVar
       getter pointer : LLVM::Value
@@ -799,6 +862,24 @@ module Crystal
         proc_name = false
         fun_literal_name = "~fun_literal"
       end
+      # Incremental codegen: a proc literal in a generic method body is emitted once
+      # per enclosing instantiation, and multiple such procs share the same base name
+      # (`~proc<type>@file:line`). The plain emission-order counter below numbers them
+      # by codegen walk order, which differs cold-vs-warm (the seed appends pruned
+      # instantiations), breaking byte-identical incremental==cold. Instead key the
+      # number on the enclosing function (its mangled name is unique per instantiation
+      # and deterministic) plus a per-enclosing source-order index. The full enclosing
+      # name keeps every distinct proc's symbol unique (no `.N`, no dedup), and the
+      # numbering no longer depends on emission order.
+      if track_generated_funs?
+        enclosing = context.fun.name
+        key = "#{fun_literal_name} #{enclosing}"
+        idx = @proc_counts[key] + 1
+        @proc_counts[key] = idx
+        suffix = idx > 1 ? idx.to_s : ""
+        return Crystal.safe_mangling(@program, "#{fun_literal_name}~in~#{enclosing}#{suffix}")
+      end
+
       proc_count = @proc_counts[fun_literal_name]
       proc_count += 1
       @proc_counts[fun_literal_name] = proc_count
@@ -1620,6 +1701,8 @@ module Crystal
     def type_id_to_class_name(type_id)
       map_name = "__crystal_type_id_to_class_name_map"
 
+      record_main_symbol("classname_map", map_name, "")
+
       global = @main_mod.globals[map_name]?
       unless global
         global = @main_mod.globals.add(@main_llvm_typer.llvm_type(@program.string).array(@program.llvm_id.@ids.size), map_name)
@@ -1860,6 +1943,7 @@ module Crystal
 
     def check_proc_is_not_closure(value, type)
       check_fun_name = "~check_proc_is_not_closure"
+      record_main_symbol("check_proc", check_fun_name, "")
       func = typed_fun?(@main_mod, check_fun_name) || create_check_proc_is_not_closure_fun(check_fun_name)
       func = check_main_fun check_fun_name, func
       value = call func, [value] of LLVM::Value
@@ -2552,14 +2636,74 @@ module Crystal
       @last = last
     end
 
+    # Incremental codegen (Approach 2): emitting reused modules as
+    # declarations-only prunes reachability, so a function in a *changed* module
+    # reachable only through a skipped caller is never walked. Re-generate those
+    # by seeding the walk with the previous build's live set, restricted to
+    # changed (non-skipped) non-main modules. Because a skipped module is
+    # unchanged, its set of callees is identical to last build, so every such
+    # pruned function was live last build and is in `prev_live`. Seeding a live
+    # function re-runs the normal top-down generation, discovering its callees
+    # naturally. `target_def_fun` is a no-op for functions the root walk already
+    # materialized. Only previously-live functions are seeded, so dead
+    # instantiations (whose bodies may hold un-codegen'able expanded calls) are
+    # never force-generated.
+    # Record a lazily-emitted main-resident helper symbol for incremental replay.
+    def record_main_symbol(kind : String, name : String, key : String,
+                           shape : IncrementalCodegen::SymbolShape? = nil,
+                           aux : Hash(String, String)? = nil)
+      return unless track_generated_funs?
+      return unless @main_symbol_names.add?(name)
+      @main_symbols << IncrementalCodegen::MainSymbolRecord.new(kind, name, key, shape, aux)
+    end
+
+    # Snapshot the symbols main defines right after the constructor (before any
+    # body walk). These eager symbols are re-emitted on every build, so the
+    # incremental pre-flight always treats them as satisfied.
+    def snapshot_eager_main
+      return unless track_generated_funs?
+      exports, _imports = IncrementalCodegen.module_symbols(@main_mod)
+      @eager_main_symbols = exports
+    end
+
+    def codegen_changed_instantiations(prev_live : Hash(String, Array(String)))
+      return if ENV["CRYSTAL_INC_NO_SEED"]?
+      index = IncrementalCodegen.instantiation_index(@program)
+      prev_live.each do |mod, names|
+        next if @skip_modules.includes?(mod) # reused module: cached `.o` has the bodies
+        names.each do |name|
+          if entry = index[name]?
+            if ENV["CRYSTAL_INC_WATCH"]?
+              actual = entry[0].mangled_name(@program, entry[1])
+              STDERR.puts "[inc-seed] COLLISION root=#{name} resolves-to=#{actual}" if actual != name
+            end
+            @inc_seed_root = name
+            target_def_fun(entry[0], entry[1])
+          end
+        end
+      end
+    end
+
     def build_string_constant(str, name = "str", *, llvm_mod = @llvm_mod, llvm_typer = @llvm_typer)
+      # In incremental mode, derive the display name from the (content-deduped)
+      # string itself rather than the caller-supplied `name`, which varies per call
+      # site for the same string and would otherwise make the global name depend on
+      # which build-order site created it first.
+      name = str if track_generated_funs?
       name = "#{name[0..18]}..." if name.bytesize > 18
       name = name.gsub '@', '.'
       name = "'#{name}'"
       key = StringKey.new(llvm_mod, str)
       @strings.put_if_absent(key) do
         llvm_context = llvm_mod.context
-        global = llvm_mod.globals.add(llvm_typer.llvm_string_type(str.bytesize), name.gsub('\\', "\\\\"))
+        # In incremental mode, disambiguate the (truncated, 18-char) display name
+        # with a content hash. Otherwise distinct strings sharing a prefix collide on
+        # the same name and LLVM appends an order-dependent `.N` suffix, which breaks
+        # byte-identical incremental==cold output (the suffix tracks emission order).
+        # 16 hex digits (64 bits) keeps the chance of two distinct strings hashing
+        # to the same suffix negligible across a whole program's string set.
+        global_name = track_generated_funs? ? "#{name}.#{::Crystal::Digest::MD5.hexdigest(str)[0, 16]}" : name
+        global = llvm_mod.globals.add(llvm_typer.llvm_string_type(str.bytesize), global_name.gsub('\\', "\\\\"))
         global.linkage = LLVM::Linkage::Private
         global.global_constant = true
         global.initializer = llvm_context.const_struct [

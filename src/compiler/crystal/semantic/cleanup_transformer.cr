@@ -81,6 +81,22 @@ module Crystal
       @def_nest_count += 1
     end
 
+    # Clean a single method instantiation's body, mirroring the call-site path in
+    # `transform(Call)` (the `@transformed` guard, `@current_def`/`@def_nest_count`
+    # bookkeeping). The resident re-codegen path uses this for re-green-created
+    # instances: the normal cleanup walk stops at any def whose callers were
+    # already cleaned on a previous cycle, so it would never reach these new
+    # bodies. Idempotent: the guard makes a second call a no-op.
+    def cleanup_def(target_def : Def) : Nil
+      return unless @transformed.add?(target_def)
+      current_def = @current_def
+      @current_def = target_def
+      @def_nest_count += 1
+      target_def.body = target_def.body.transform(self)
+      @def_nest_count -= 1
+      @current_def = current_def
+    end
+
     def after_transform(node)
       case node
       when And, Or, If, RespondsTo, IsA, Assign

@@ -39,9 +39,19 @@ class Crystal::Program
       visit_main(node, process_finished_hooks: true, cleanup: cleanup, visitor: main_visitor)
     end
 
-    @progress_tracker.stage("Semantic (cleanup)") do
-      cleanup_types
-      cleanup_files
+    # In re-green mode the node was NOT cleaned inside `visit_main` (cleanup:false),
+    # so running type/file cleanup here would clean types BEFORE the node — a
+    # different order than a normal build (node-clean then type-clean), which
+    # perturbs order-sensitive codegen (virtual-dispatch branch layout) and breaks
+    # byte identity vs a cold build. The re-green caller does the full node+type+
+    # file cleanup itself, in the normal order, before codegen. Scope the skip to
+    # re-green: ordinary `cleanup:false` callers (the `no_cleanup` tools) keep their
+    # existing behavior.
+    unless !cleanup && regreen
+      @progress_tracker.stage("Semantic (cleanup)") do
+        cleanup_types
+        cleanup_files
+      end
     end
 
     @progress_tracker.stage("Semantic (recursive struct check)") do

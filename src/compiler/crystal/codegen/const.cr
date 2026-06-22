@@ -200,7 +200,14 @@ class Crystal::CodeGenVisitor
             global.initializer = @last
             global.global_constant = true
 
-            if const_type.is_a?(PrimitiveType) || const_type.is_a?(EnumType)
+            # `const.initializer` lets later reads load the global bare instead of
+            # via the `:const_read` function. But it's only set once the const's init
+            # has been codegen'd, so whether a given read sees it depends on walk
+            # order — which differs cold-vs-warm (the seed reorders). Leaving it unset
+            # under incremental makes every read use the (order-independent) read
+            # function, keeping the access IR byte-identical across builds. The global
+            # is still a baked constant; the read function just guards a no-op init.
+            if (const_type.is_a?(PrimitiveType) || const_type.is_a?(EnumType)) && !track_generated_funs?
               const.initializer = @last
             end
           else
@@ -244,6 +251,9 @@ class Crystal::CodeGenVisitor
 
     if !const.needs_init_flag?
       global_name = const.llvm_name
+      # bare value global lives in main; capture its frozen (no-read-fn) shape
+      record_main_symbol("const", global_name, const.llvm_name,
+        IncrementalCodegen::SymbolShape.new(emitted_read_fn: false, no_init_flag: const.no_init_flag?))
       global = declare_const(const)
 
       if @llvm_mod != @main_mod
@@ -255,6 +265,8 @@ class Crystal::CodeGenVisitor
     end
 
     read_function_name = "~#{const.llvm_name}:const_read"
+    record_main_symbol("const", read_function_name, const.llvm_name,
+      IncrementalCodegen::SymbolShape.new(emitted_read_fn: true, no_init_flag: const.no_init_flag?))
     func = typed_fun?(@main_mod, read_function_name) || create_read_const_function(read_function_name, const)
     func = check_main_fun read_function_name, func
     call func

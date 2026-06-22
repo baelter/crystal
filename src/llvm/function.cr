@@ -11,6 +11,12 @@ struct LLVM::Function
     BasicBlockCollection.new self
   end
 
+  # True when this function has no body (an external declaration), i.e. its
+  # definition lives in another module / object file.
+  def declaration? : Bool
+    LibLLVM.get_first_basic_block(self).null?
+  end
+
   def call_convention
     LLVM::CallConvention.new LibLLVM.get_function_call_convention(self)
   end

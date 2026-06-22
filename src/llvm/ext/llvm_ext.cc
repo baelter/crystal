@@ -1,7 +1,11 @@
 #include <llvm/Config/llvm-config.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/Module.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm-c/TargetMachine.h>
+#include <algorithm>
+#include <vector>
 
 using namespace llvm;
 
@@ -22,6 +26,46 @@ DEFINE_SIMPLE_CONVERSION_FUNCTIONS(OperandBundleDef, LLVMOperandBundleRef)
 #endif
 
 extern "C" {
+
+// Sort a module's functions by name so object-file output is deterministic
+// regardless of the order functions were emitted into the module. Incremental
+// codegen's seed/force phases append pruned-but-live functions after the main
+// walk, which otherwise perturbs `.text` and `.eh_frame` layout (and the FDE
+// order) versus a cold build, breaking byte-for-byte incremental==cold identity.
+// Function order is semantically irrelevant, so this is a safe normalization.
+void LLVMExtSortModuleFunctions(LLVMModuleRef M) {
+  unwrap(M)->getFunctionList().sort([](const Function &A, const Function &B) {
+    return A.getName() < B.getName();
+  });
+}
+
+// Likewise sort global variables by name. `.rodata` (string/constant globals) is
+// laid out in global-list order, which the incremental seed perturbs the same way.
+// All Crystal globals are named (string content / type), so this is deterministic.
+void LLVMExtSortModuleGlobals(LLVMModuleRef M) {
+  Module *Mod = unwrap(M);
+#if LLVM_VERSION_GE(16, 0)
+  // getGlobalList() is private since LLVM 16; insertGlobalVariable /
+  // removeFromParent are the public replacements. Remove all globals and
+  // re-insert them in sorted order.
+  std::vector<GlobalVariable *> Globals;
+  for (GlobalVariable &G : Mod->globals())
+    Globals.push_back(&G);
+  std::stable_sort(Globals.begin(), Globals.end(),
+                   [](GlobalVariable *A, GlobalVariable *B) {
+                     return A->getName() < B->getName();
+                   });
+  for (GlobalVariable *G : Globals)
+    G->removeFromParent();
+  for (GlobalVariable *G : Globals)
+    Mod->insertGlobalVariable(G);
+#else
+  // Pre-16 the global list is public and directly sortable, like functions.
+  Mod->getGlobalList().sort([](const GlobalVariable &A, const GlobalVariable &B) {
+    return A.getName() < B.getName();
+  });
+#endif
+}
 
 #if !LLVM_VERSION_GE(9, 0)
 LLVMMetadataRef LLVMExtDIBuilderCreateEnumerator(LLVMDIBuilderRef Builder,
